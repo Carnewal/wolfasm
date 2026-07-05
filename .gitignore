@@ -1,0 +1,36 @@
+# === Large / external / regenerated — not committed ===
+# Emscripten SDK (install locally; ~GBs)
+/emsdk/
+
+# id Software Enemy-Territory source (reference only; clone from id-Software)
+/Enemy-Territory/
+
+# Copyrighted game data — DO NOT COMMIT (retail + mod pk3s, packaged bundles)
+/assets/
+/assets_mods/
+*.pk3
+*.pk3.tmp
+
+# Build output + asset bundles + downloaded server paks (regenerated)
+/etlegacy/build-wasm/
+
+# Nested fork git dir, renamed aside so the source is captured as plain files.
+# Restore with: mv etlegacy/.git_disabled etlegacy/.git
+/etlegacy/.git_disabled/
+
+# Emscripten data bundles / build artifacts (safety net)
+*.data
+*.wasm
+*.o
+*.obj
+*.a
+*.bc
+
+# Node
+**/node_modules/
+
+# Editor / session / OS junk
+/.claude/
+.DS_Store
+Thumbs.db
+*.swp

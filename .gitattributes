@@ -1,0 +1,10 @@
+# Keep the port patch byte-exact so `git apply` always works.
+*.patch -text
+# Normalize source to LF in the repo.
+*.c    text eol=lf
+*.h    text eol=lf
+*.js   text eol=lf
+*.py   text eol=lf
+*.cmake text eol=lf
+*.md   text
+*.ps1  text eol=crlf

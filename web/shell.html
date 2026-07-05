@@ -1,0 +1,140 @@
+<!--
+  ET: Legacy WASM — Emscripten HTML shell
+  Used via: emcc ... --shell-file web/shell.html
+  {{{ SCRIPT }}} is replaced by emscripten with the module loader script.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #000; color: #ccc; font-family: monospace; height: 100%; overflow: hidden; }
+  #wrap { display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; }
+  /* Keep the canvas at the renderer's 4:3 aspect and scale it UNIFORMLY to fit
+     the viewport. Non-uniform stretching (100vw x 100vh) distorts Emscripten's
+     clientX/Y -> canvas-pixel mapping, causing the in-game cursor to drift from
+     the real mouse position. */
+  #canvas { border: 0; background: #000; display: block; aspect-ratio: 4 / 3;
+            width: auto; height: 100vh; max-width: 100vw; }
+  @media (max-aspect-ratio: 4/3) { #canvas { width: 100vw; height: auto; max-height: 100vh; } }
+  #status { position: fixed; top: 8px; left: 8px; z-index: 10; font-size: 13px; text-shadow: 0 0 3px #000; }
+  #progress { position: fixed; top: 28px; left: 8px; z-index: 10; width: 240px; }
+  #output { position: fixed; bottom: 0; left: 0; right: 0; max-height: 30vh; overflow: auto;
+            background: rgba(0,0,0,0.6); font-size: 11px; white-space: pre-wrap; padding: 4px; display: none; }
+</style>
+
+<div id="wrap">
+  <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+  <div id="status">Downloading…</div>
+  <progress id="progress" value="0" max="100" hidden></progress>
+  <pre id="output"></pre>
+</div>
+
+<script type="text/javascript">
+  var statusEl = document.getElementById('status');
+  var progressEl = document.getElementById('progress');
+  var outputEl = document.getElementById('output');
+
+  var Module = {
+    canvas: (function () {
+      var c = document.getElementById('canvas');
+      // Emscripten/SDL relies on this to detect WebGL context loss.
+      c.addEventListener('webglcontextlost', function (e) {
+        alert('WebGL context lost. You will need to reload the page.');
+        e.preventDefault();
+      }, false);
+      return c;
+    })(),
+    print: function (text) {
+      if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+      console.log(text);
+      if (outputEl) { outputEl.style.display = 'block'; outputEl.textContent += text + '\n'; outputEl.scrollTop = outputEl.scrollHeight; }
+    },
+    printErr: function (text) {
+      if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+      // Keep an uncapped in-page log tail for debugging (readable via eval).
+      (window.__etlog || (window.__etlog = [])).push(text);
+      if (window.__etlog.length > 6000) window.__etlog.shift();
+      console.error(text);
+    },
+    setStatus: function (text) {
+      if (!Module.setStatus.last) Module.setStatus.last = { time: Date.now(), text: '' };
+      if (text === Module.setStatus.last.text) return;
+      var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
+      var now = Date.now();
+      if (m && now - Module.setStatus.last.time < 30) return;
+      Module.setStatus.last.time = now;
+      Module.setStatus.last.text = text;
+      if (m) {
+        progressEl.hidden = false;
+        progressEl.value = parseInt(m[2]) * 100;
+        progressEl.max = parseInt(m[4]) * 100;
+        statusEl.textContent = m[1];
+      } else {
+        progressEl.hidden = true;
+        statusEl.textContent = text;
+        if (!text) statusEl.style.display = 'none';
+      }
+    },
+    totalDependencies: 0,
+    monitorRunDependencies: function (left) {
+      this.totalDependencies = Math.max(this.totalDependencies, left);
+      Module.setStatus(left ? 'Preparing… (' + (this.totalDependencies - left) + '/' + this.totalDependencies + ')' : 'All downloads complete.');
+    },
+    // ET Legacy command line: read game data from the preloaded /etl package.
+    arguments: [
+      '+set', 'fs_basepath', '/etl',
+      '+set', 'fs_homepath', '/etlhome',
+      '+set', 'r_fullscreen', '0',
+      // Pre-set video cvars to the first-run preset values so that
+      // execing preset_high.cfg does NOT trigger a vid_restart (which
+      // destabilises the Emscripten main loop when done mid-frame).
+      '+set', 'r_mode', '6',
+      '+set', 'r_colorbits', '32',
+      '+set', 'r_depthbits', '24',
+      '+set', 'r_texturebits', '32',
+      '+set', 'r_picmip', '0',
+      '+set', 'r_customwidth', '1024',
+      '+set', 'r_customheight', '768',
+      // WebSocket bridge for reaching real ET servers (see bridge/).
+      '+set', 'net_wsbridge', 'ws://localhost:9000/',
+      // The browser can't DNS-resolve to real UDP peers, so point the master
+      // and motd servers at pre-resolved numeric IPs (master.etlegacy.com /
+      // motd.etlegacy.com -> 104.248.140.165). Ports must be explicit.
+      '+set', 'com_masterServer', '104.248.140.165:27950',
+      '+set', 'sv_master1', '104.248.140.165:27950',
+      '+set', 'com_motdServer', '104.248.140.165:27951',
+    ].concat((function () {
+      // Allow driving the client from the URL without rebuilding, e.g.
+      //   etl.html?connect=1.2.3.4:27960   -> auto-connect to a live server
+      //   etl.html?exec=globalservers%201%2084%20empty%20full
+      var extra = [];
+      try {
+        var p = new URLSearchParams(location.search);
+        if (p.get('connect')) { extra.push('+connect', p.get('connect')); }
+        if (p.get('exec')) { p.get('exec').split(';').forEach(function (cmd) { cmd = cmd.trim(); if (cmd) { extra.push('+' + cmd.split(' ')[0]); cmd.split(' ').slice(1).forEach(function (a) { extra.push(a); }); } }); }
+      } catch (e) {}
+      return extra;
+    })()),
+    onAbort: function (what) {
+      window.__abort = String(what);
+      (window.__etlog || (window.__etlog = [])).push('ONABORT: ' + window.__abort);
+    },
+    onExit: function (code) {
+      window.__exit = code;
+      (window.__etlog || (window.__etlog = [])).push('ONEXIT: ' + code);
+    },
+  };
+
+  Module.setStatus('Downloading…');
+  window.addEventListener('error', function (ev) {
+    window.__lasterr = (ev && ev.error && ev.error.stack) ? ev.error.stack : String(ev && ev.message);
+    (window.__etlog || (window.__etlog = [])).push('WINERR: ' + window.__lasterr);
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    window.__lasterr = 'REJECT: ' + (ev && ev.reason && ev.reason.stack ? ev.reason.stack : String(ev && ev.reason));
+    (window.__etlog || (window.__etlog = [])).push(window.__lasterr);
+  });
+</script>
+<!-- Asset packages — populate the virtual FS at /etl before main().
+     etl_data.js  = base paks (etmain) + legacy mod client assets
+     etl_mods_data.js = cgame/ui/qagame SIDE_MODULE .wasm binaries -->
+<script async type="text/javascript" src="etl_data.js"></script>
+<script async type="text/javascript" src="etl_mods_data.js"></script>
+{{{ SCRIPT }}}

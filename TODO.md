@@ -12,53 +12,40 @@ UDP). Goal: run the game in the browser and play on live servers.
 Layout (repo root `wolfasm/`):
 - `etlegacy/` — engine source with all the Emscripten port changes (guarded by
   `__EMSCRIPTEN__` / `EMSCRIPTEN`). This is the code you edit.
-- `bridge/etl-ws-bridge.js` — Node WebSocket↔UDP relay.
-- `web/shell.html` — Emscripten HTML shell (canvas + loader + startup args).
-- `web/serve.py` — dev HTTP server (threaded, right MIME/cache headers).
+- `web/shell.html` — Emscripten HTML shell (canvas + loader + startup args), baked
+  into `etl.html` at link time (`--shell-file`).
+- `bridge/main.go` — unified Go server: serves the shell + `/ws` relay + `/dl`
+  download proxy on one port. `/` → shell. Config via `.env` (see
+  `bridge/.env.example`, `bridge/README.md`). This is the only server/bridge now.
 - **Not in git** (you must supply locally): `emsdk/` (Emscripten SDK),
   `assets/` + `assets_mods/` (retail + mod pk3s — copyrighted, keep them out of
   git), `etlegacy/build-wasm/` (build output + `etl.data` asset bundle + any
   downloaded server paks). See "Environment setup" below.
 
-## ⚠️ CURRENT BLOCKER (was mid-investigation) — black 3D world
+## ✅ RESOLVED — black/untextured 3D world + fall-through-the-world collision
 
-**Symptom:** In-game, the 2D HUD renders fine (compass, ammo, warmup text,
-limbo command-map, menus), and game logic works (collision, weapon fire,
-movement all update state correctly), **but the 3D world view itself is black.**
-We had been "verifying" via HUD/state readouts and screenshots of 2D screens, so
-this was masked until noticed at first-person spawn.
+Both former blockers are **fixed and verified in-browser** (local `devmap oasis`,
+headless Chrome via WSLg — see "Environment setup"). The world renders fully
+textured with mipmaps, and the player stands/walks on the ground.
 
-**Strong hypothesis:** Emscripten's `LEGACY_GL_EMULATION` prints
-`"DrawElements doesn't actually prepareClientAttributes properly."` during load.
-The ET GLES renderer draws **world geometry** with `glDrawElements` + client-side
-vertex arrays (`glVertexPointer`/`glTexCoordPointer`/`glColorPointer`). The 2D
-HUD path renders (different code path), but 3D world surfaces via
-`glDrawElements`+client arrays don't → black scene.
+**Textures (was: black world; "tan/untextured" on some GL backends).** The GLES1
+renderer set the OpenGL-ES-1.1 auto-mipmap parameter
+`glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, TRUE)` — a **no-op in
+WebGL/GLES2**, so mip levels were never built. Under the default
+`GL_LINEAR_MIPMAP_NEAREST` min-filter the world textures were WebGL-incomplete and
+sampled **black** (the 2D HUD used non-mipmapped textures, which is why it worked).
+Fix (`src/rendererGLES/tr_image.c`, patch 09): call `glGenerateMipmap()` explicitly
+after the level-0 upload. Textures are already scaled to power-of-two, so it's valid.
 
-**Next steps to confirm/fix (in order):**
-1. Reproduce: get a first-person 3D view. Load a local map with no warmup so you
-   spawn straight into first person:
-   `etl.html?exec=sv_pure 0;set bot_enable 0;set g_doWarmup 0;devmap oasis`
-   then (via the JS command hook, see below) `team r; class s 3 3`, wait for the
-   spawn wave, press ESC (synthetic key) to close limbo. Confirm black 3D.
-2. Confirm the cause: check the console/`window.__etlog` for the
-   `prepareClientAttributes` warning and any `glError`. Sample the framebuffer
-   with `gl.readPixels` (or `preview_screenshot`) — expect ~all black except HUD.
-3. Fix options, roughly increasing effort:
-   - Patch Emscripten's GL emulation (`emsdk/upstream/emscripten/src/lib/libglemu.js`)
-     to actually set up client vertex attributes for `glDrawElements`. We already
-     patched this file once (added `.sig` to reassigned GL wrappers for
-     `addFunction` — see that change for the pattern). The client-array path is
-     the likely gap.
-   - Or make the renderer avoid client-side arrays: upload world geometry to
-     real GL buffers (VBOs) and use `glDrawElements` with bound buffers, which
-     Emscripten GL handles correctly. This is renderer surgery in
-     `etlegacy/src/rendererGLES/` (tess/backend `RB_*`, `R_DrawElements`).
-   - Or evaluate switching to a GLES2/shader path if one exists.
-4. **Watch for regressions:** the collision fix (below) restores `cm.leafs` at
-   trace time; make sure any renderer change doesn't reintroduce the heap
-   corruption (the corrupt data was drawVert floats — a renderer/GL pointer bug —
-   so the two may be related; see "Collision" note).
+**Collision (was: fall through the world).** A stray write during renderer
+world-load overwrites collision memory with drawVert floats (a corrupt
+`cm.leafs[].cluster` reads back as the bits of ~0.375). The array that actually
+broke traces was **`cm.planes`** (traces returned frac=1.0 through the floor), which
+the old leafs-only snapshot never touched. Fix (`src/qcommon/cm_load.c`, patch 06):
+back up ALL trace-critical arrays (planes/brushsides/brushes/nodes/leafs/leafbrushes/
+leafsurfaces, map portion only) after load and restore any a cheap sampled checksum
+shows corrupt, at the top of every trace. The real wild write is still unfixed
+(needs a wasm watchpoint) — this is a robust workaround.
 
 ## What already works (do not re-do)
 
@@ -68,7 +55,7 @@ HUD path renders (different code path), but 3D world surfaces via
 - **Boots & renders 2D**: SDL2 + WebGL, menus, profile creation, server browser
   (populated from the real master server via the bridge).
 - **Networking**: `src/sys/net_emscripten.c` tunnels the UDP netchan over a
-  WebSocket to `bridge/etl-ws-bridge.js`. Master query, challenge→connect→
+  WebSocket to the Go server (`bridge/main.go`, `/ws`). Master query, challenge→connect→
   gamestate handshake, live snapshots all work.
 - **UDP pk3 download over the bridge** (fixed): `cl_wwwDownload 0` forces the
   windowed UDP download, which now completes over the relay (was stalling). Note
@@ -155,30 +142,57 @@ To demonstrate the full remote gameplay flow, use a **stock ET: Legacy 2.84.x
 server without custom anti-cheat** (our cgame is compatible there), or a local
 `devmap`.
 
+### Dev/test server for this round: `78.46.121.107:27961`
+
+Use this address for connection/gameplay investigation — it's expected to be more
+compatible (stock-ish 2.84.x, no aggressive anti-tamper) than the hirntot box, and
+it pairs with the **v2.84.0 rebase** above (matching the client to the exact
+release the server runs is the point of the rebase). Drive it via the JS hook:
+`Module.ccall('ETL_ExecCommand','null',['string'],['connect 78.46.121.107:27961'])`
+with the Go server running (`cd bridge && ./wolfasm-server`, serves ws + shell).
+
 ## Reconstructing the engine source (the port is shipped as a patch)
 
 This repo does **not** contain the full ET: Legacy tree (it's a large fork with
-submodules + signing keystores). Our port lives in `port/etlegacy-port.patch`
-(31 files: 26 modified + 5 new), against ET: Legacy commit **`b05dffd61`**
-(`v2.84.0-18-gb05dffd`). To reconstruct a buildable tree:
+submodules + signing keystores). Our port lives in `port/` (31 files: 26 modified
++ 5 new), now rebased onto the tagged release **ET: Legacy `v2.84.0`** (git commit
+**`764ffc00a953e59aaf435272d004c49a89710309`**). We build against the exact tag on
+purpose: live servers run 2.84.0, and matching it avoids client/server
+version-mismatch connection problems. (It was previously cut against the dev
+snapshot `b05dffd61` = `v2.84.0-18-gb05dffd`; the rebase needed only one trivial
+context fix in `cmake/ETLPlatform.cmake`.)
+
+The port lives in `port/patches/01..10-*.patch` — the change **split by concern**
+(small, reviewable). Apply all ten in numeric order. There is intentionally **no
+single combined patch**; maintain the split files only. See
+`port/patches/README.md` for the file-by-file map.
+
+To reconstruct a buildable tree:
 
 ```bash
 git clone https://github.com/etlegacy/etlegacy.git
 cd etlegacy
-git checkout b05dffd61
-git submodule update --init --recursive     # if libs/ come up empty
-git apply ../port/etlegacy-port.patch        # applies ALL our port changes
+git checkout v2.84.0                          # == 764ffc0
+git submodule update --init --recursive       # needs libs/ (minizip, cjson, sqlite3, ...)
+for p in ../port/patches/[0-9]*.patch; do git apply "$p"; done
 ```
 
-The patch includes the two `emscripten_*.ps1` build scripts and the new
+The port includes the `emscripten_*.ps1` build scripts (Windows) and the new
 `cmake/ETLEmscripten.cmake`, `src/sys/net_emscripten.c`,
-`src/sys/emscripten_gl_shim.c`. After applying, follow "Environment setup".
+`src/sys/emscripten_gl_shim.c`. On **Linux** use `build-wasm.sh` at the repo root
+(emsdk + ninja) instead of the `.ps1` scripts. After applying, follow
+"Environment setup".
 
 ## Environment setup (for a fresh clone)
 
 Not in git — obtain locally:
 1. `emsdk/` — install Emscripten (6.x) at repo root, or point the scripts at your
    emsdk. The `.ps1` scripts source `emsdk/emsdk_env.ps1`.
+   - **Patch the SDK**: apply `port/emsdk-patches/*` to `emsdk/upstream/emscripten`.
+     `libglemu-addfunction-sig.patch` is **required** — without it the MAIN_MODULE
+     build aborts at boot ("Missing signature argument to addFunction"). On Linux
+     `./build-wasm.sh configure` (and `./build-wasm.sh patch-emsdk`) applies it
+     idempotently; **re-run after any `emsdk install`/update** (it resets SDK files).
 2. `assets/etmain/*.pk3` — retail ET paks from https://mirror.etlegacy.com/etmain/
    (+ legacy mod assets). Then package into the asset bundle:
    ```powershell
@@ -190,9 +204,9 @@ Not in git — obtain locally:
    `./emscripten_build.ps1` (or `./emscripten_build.ps1 etl` for just the engine).
    Editing `web/shell.html` does NOT retrigger a link — delete
    `build-wasm/etl.html` before rebuilding, or the shell won't update.
-4. Run: `python web/serve.py 8080 etlegacy/build-wasm`, open
-   `http://localhost:8080/etl.html`. For live servers:
-   `cd bridge && npm install ws && node etl-ws-bridge.js --port 9000`.
+4. Run: `cd bridge && go build -o wolfasm-server . && WOLFASM_WEBROOT=../etlegacy/build-wasm ./wolfasm-server`
+   then open `http://localhost:8080/` — the Go server serves the shell, the `/ws`
+   relay (live servers) and the `/dl` download proxy on one port.
 
 Windows / PowerShell: each `.ps1` rebuilds `$env:Path` from the registry and
 sources `emsdk_env.ps1` with `$env:EMSDK_QUIET=1`.
@@ -216,15 +230,39 @@ Key ones: `cmake/ETLEmscripten.cmake`, `cmake/ETLBuild{Client,Mod}.cmake`,
 vm.c,q_platform.h,q_shared.h}`,
 `src/client/{cl_main.c,cl_parse.c,cl_scrn.c,cl_ui.c}`,
 `src/{cgame,ui,game}/*_main.c` (17-arg `vmMain`), `web/shell.html`,
-`bridge/etl-ws-bridge.js`.
+`bridge/main.go`.
 
 ## Priority order for next session
 
-1. **Fix the black 3D world** (the blocker) — see the section above.
-2. Once 3D renders: demonstrate full flow on a stock legacy server or local
-   devmap — spawn, walk, jump, fire (tooling is ready).
-3. (Optional) Find the real stray-writer root cause; if it's the renderer
-   client-array bug, fixing #1 may remove the need for the collision
-   backup/restore workaround.
-4. (Optional) Implement HTTP `Com_BeginWebDownload` via a `serve.py` proxy +
-   Emscripten fetch so pure servers' `wwwdl` works without the manual side-load.
+**Done (verified in-browser on Linux):**
+- ✅ **Rebased onto ET: Legacy `v2.84.0` (`764ffc0`)** and **split the port into ten
+  per-concern patches** (`port/patches/01..10`, no combined patch). All apply
+  cleanly on a pristine `v2.84.0` checkout.
+- ✅ **Full Linux build+debug toolchain** — no Windows needed. `emsdk` (6.0.2) +
+  `.tools/bin/ninja` + `build-wasm.sh`; headless Chrome via WSLg is GPU-accelerated
+  and gives screenshots + synthetic input (`debug/etl-drive.mjs`).
+- ✅ **Textures fixed** — world renders fully textured with mipmaps
+  (`glGenerateMipmap`, patch 09). See RESOLVED section.
+- ✅ **Collision fixed** — player stands/walks, no fall-through (comprehensive
+  `cm` array backup/restore, patch 06). See RESOLVED section.
+- ✅ **Profile/settings persist** across reloads — `/etlhome` mounted as IDBFS +
+  auto-seeded profile (no more first-run "enter a name"). `web/shell.html`.
+- ✅ **Bridge-proxied pk3 downloads + per-origin cache** (patch 11 + bridge `/dl`
+  endpoint) — pure-server paks fetched server-side (no libcurl/CORS), cached per
+  origin, with UDP-over-bridge fallback when the server's www mirror lacks a pak.
+- ✅ **Connected to the live server `78.46.121.107:27961`** (ET:L 2.83.2, pure):
+  handshake → pure check → downloaded all 3 custom paks (legacy_v2.83.2 via proxy,
+  ww2_etcamp + z_hdet via UDP fallback) → cgame loaded (2.84.0 cgame is compatible)
+  → **receiving the live game snapshot stream** (real players/objectives). Verified
+  in headless Chrome.
+
+**Still open:**
+1. In-game on the live server: join a team/class and spawn to first-person (as the
+   local `devmap` flow does). UDP downloads of the mirror-missing paks are slow
+   (~5KB/s, server rate-limited) on the FIRST connect; they then persist in IDBFS so
+   subsequent connects are instant.
+2. (Optional) Find the real stray-writer root cause (needs a wasm memory watchpoint;
+   the corrupt data is drawVert floats landing in `cm.planes`/`cm.leafs`). Fixing it
+   would let the collision backup/restore workaround be removed.
+3. (Optional) Weapon viewmodel/some models still look dark on the D3D12 backend —
+   worth checking model (vertex-lit) shading vs other GL backends.

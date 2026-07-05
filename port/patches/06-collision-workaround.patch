@@ -1,0 +1,373 @@
+diff --git a/src/qcommon/cm_load.c b/src/qcommon/cm_load.c
+index ee9720a..abfcea6 100644
+--- a/src/qcommon/cm_load.c
++++ b/src/qcommon/cm_load.c
+@@ -752,7 +752,150 @@ void CM_LoadMap(const char *name, qboolean clientload, unsigned int *checksum)
+ 	{
+ 		Q_strncpyz(cm.name, name, sizeof(cm.name));
+ 	}
++
++#ifdef __EMSCRIPTEN__
++	CM_EMS_BackupLeafs();
++#endif
++}
++
++#ifdef __EMSCRIPTEN__
++// A stray write during client init (the renderer loading the world) overwrites
++// parts of the collision model with drawVert float data — verified: a corrupt
++// cm.leafs[].cluster read back as the bit pattern of a small float (e.g. 0.375).
++// The corruption is not limited to cm.leafs; it can hit any of the trace-critical
++// arrays (planes/brushsides/brushes/nodes/leafs/leafbrushes/leafsurfaces), which
++// made physical collision fail (traces pass through the floor -> fall through the
++// world). Root-causing the wild write needs a wasm memory watchpoint; until then
++// we snapshot every collision array while known-good (right after load) and
++// restore any that a cheap sampled checksum shows has changed, at the top of each
++// trace. The corruption is a one-shot during init, so after it fires once the
++// checksums match again and no copying happens on the hot path.
++//
++// Only the MAP portion of each array is snapshotted (indices [0,numX)); the box
++// hull entries appended after it (BOX_*) are legitimately rewritten per trace.
++
++#define CM_EMS_MAX_ARR 8
++
++typedef struct
++{
++	const char   *name;
++	void         *live;     ///< live array base (never reallocated after load)
++	void         *backup;   ///< malloc'd known-good copy
++	unsigned int  bytes;    ///< size of the map portion
++	unsigned int  sum;      ///< sampled checksum of the known-good copy
++	int           detect;   ///< 1: checksum it for corruption detection; 0: restore-only
++} cm_emsArr_t;
++
++static cm_emsArr_t cm_emsBak[CM_EMS_MAX_ARR];
++static int         cm_emsBakN = 0;
++
++// XOR ~256 spread 32-bit words — cheap, deterministic, catches float overwrites.
++static unsigned int CM_EMS_SampleSum(const void *p, unsigned int bytes)
++{
++	const unsigned int *w = (const unsigned int *)p;
++	unsigned int        n = bytes / 4, step = (n >> 8) + 1, i, s = 0x9e3779b9u ^ bytes;
++
++	for (i = 0; i < n; i += step)
++	{
++		s = (s * 33u) ^ w[i];
++	}
++	return s;
++}
++
++static void CM_EMS_AddArr(const char *name, void *live, unsigned int bytes, int detect)
++{
++	cm_emsArr_t *a;
++
++	if (cm_emsBakN >= CM_EMS_MAX_ARR || !live || bytes == 0)
++	{
++		return;
++	}
++	a         = &cm_emsBak[cm_emsBakN++];
++	a->name   = name;
++	a->live   = live;
++	a->bytes  = bytes;
++	a->detect = detect;
++	a->backup = malloc(bytes);
++	if (a->backup)
++	{
++		memcpy(a->backup, live, bytes);
++		a->sum = CM_EMS_SampleSum(a->backup, bytes);
++	}
++}
++
++/**
++ * @brief Snapshot all trace-critical collision arrays while known-good.
++ */
++void CM_EMS_BackupLeafs(void)
++{
++	int i;
++
++	for (i = 0; i < cm_emsBakN; i++)
++	{
++		if (cm_emsBak[i].backup)
++		{
++			free(cm_emsBak[i].backup);
++		}
++	}
++	cm_emsBakN = 0;
++	Com_Memset(cm_emsBak, 0, sizeof(cm_emsBak));
++
++	// detect=1 arrays are immutable after load, so a checksum change == corruption.
++	// brushes carry a per-trace `checkcount`, so they can't be checksummed; back
++	// them up as restore-only (reverting checkcount is harmless) and restore them
++	// alongside whenever a detected array trips.
++	CM_EMS_AddArr("planes", cm.planes, (unsigned int)cm.numPlanes * sizeof(cplane_t), 1);
++	CM_EMS_AddArr("brushsides", cm.brushsides, (unsigned int)cm.numBrushSides * sizeof(cbrushside_t), 1);
++	CM_EMS_AddArr("nodes", cm.nodes, (unsigned int)cm.numNodes * sizeof(cNode_t), 1);
++	CM_EMS_AddArr("leafs", cm.leafs, (unsigned int)cm.numLeafs * sizeof(cLeaf_t), 1);
++	CM_EMS_AddArr("leafbrushes", cm.leafbrushes, (unsigned int)cm.numLeafBrushes * sizeof(int), 1);
++	CM_EMS_AddArr("leafsurfaces", cm.leafsurfaces, (unsigned int)cm.numLeafSurfaces * sizeof(int), 1);
++	CM_EMS_AddArr("brushes", cm.brushes, (unsigned int)cm.numBrushes * sizeof(cbrush_t), 0);
++
++	Com_Printf("EMSCOL Backup: %i arrays (planes=%i sides=%i brushes=%i nodes=%i leafs=%i lb=%i ls=%i)\n",
++	           cm_emsBakN, cm.numPlanes, cm.numBrushSides, cm.numBrushes, cm.numNodes,
++	           cm.numLeafs, cm.numLeafBrushes, cm.numLeafSurfaces);
++}
++
++/**
++ * @brief Restore any collision array whose sampled checksum no longer matches the
++ * load-time snapshot. Called at the top of every trace / point-contents query.
++ */
++void CM_EMS_RestoreLeafsIfCorrupt(void)
++{
++	static int emsLog = 0;
++	int        i, bad = -1;
++
++	// Detect: only the immutable arrays are checksummed.
++	for (i = 0; i < cm_emsBakN; i++)
++	{
++		cm_emsArr_t *a = &cm_emsBak[i];
++
++		if (a->backup && a->detect && CM_EMS_SampleSum(a->live, a->bytes) != a->sum)
++		{
++			bad = i;
++			break;
++		}
++	}
++	if (bad < 0)
++	{
++		return;
++	}
++	if (emsLog < 12)
++	{
++		emsLog++;
++		Com_Printf("EMSCOL restore: '%s' corrupt -> restoring all %i collision arrays\n", cm_emsBak[bad].name, cm_emsBakN);
++	}
++	// Restore everything (including the restore-only brushes) from the snapshot.
++	for (i = 0; i < cm_emsBakN; i++)
++	{
++		if (cm_emsBak[i].backup)
++		{
++			memcpy(cm_emsBak[i].live, cm_emsBak[i].backup, cm_emsBak[i].bytes);
++		}
++	}
+ }
++#endif
+ 
+ /**
+  * @brief CM_ClearMap
+diff --git a/src/qcommon/cm_local.h b/src/qcommon/cm_local.h
+index 1c70618..385abcb 100644
+--- a/src/qcommon/cm_local.h
++++ b/src/qcommon/cm_local.h
+@@ -192,6 +192,14 @@ extern cvar_t    *cm_playerCurveClip;
+ extern cvar_t    *cm_optimize;
+ extern cvar_t    *cm_optimizePatchPlanes;
+ 
++#ifdef __EMSCRIPTEN__
++// A stray write during client init corrupts the cm.leafs array (see the note in
++// cm_test.c / CM_AreasConnected). Snapshot it while valid at load and restore on
++// demand so collision keeps working. Defined in cm_load.c.
++void CM_EMS_BackupLeafs(void);
++void CM_EMS_RestoreLeafsIfCorrupt(void);
++#endif
++
+ // cm_test.c
+ 
+ /**
+diff --git a/src/qcommon/cm_test.c b/src/qcommon/cm_test.c
+index 61a2d28..1f18e99 100644
+--- a/src/qcommon/cm_test.c
++++ b/src/qcommon/cm_test.c
+@@ -292,6 +292,10 @@ int CM_PointContents(const vec3_t p, clipHandle_t model)
+ 	float    d;
+ 	cmodel_t *clipm;
+ 
++#ifdef __EMSCRIPTEN__
++	CM_EMS_RestoreLeafsIfCorrupt();
++#endif
++
+ 	if (!cm.numNodes)     // map not loaded
+ 	{
+ 		return 0;
+@@ -309,9 +313,21 @@ int CM_PointContents(const vec3_t p, clipHandle_t model)
+ 	}
+ 
+ 	contents = 0;
++#ifdef __EMSCRIPTEN__
++	if (leaf->numLeafBrushes < 0 || leaf->numLeafBrushes > cm.numLeafBrushes + 2)
++	{
++		return 0;
++	}
++#endif
+ 	for (k = 0 ; k < leaf->numLeafBrushes ; k++)
+ 	{
+ 		brushnum = cm.leafbrushes[leaf->firstLeafBrush + k];
++#ifdef __EMSCRIPTEN__
++		if (brushnum < 0 || brushnum >= cm.numBrushes + 1)
++		{
++			continue;
++		}
++#endif
+ 		b        = &cm.brushes[brushnum];
+ 
+ 		// see if the point is in the brush
+@@ -467,7 +483,11 @@ void CM_AdjustAreaPortalState(int area1, int area2, qboolean open)
+ 
+ 	if (area1 >= cm.numAreas || area2 >= cm.numAreas)
+ 	{
++#ifdef __EMSCRIPTEN__
++		return;     // see CM_AreasConnected: tolerate corrupt cm.leafs[].area
++#else
+ 		Com_Error(ERR_DROP, "CM_ChangeAreaPortalState: bad area number");
++#endif
+ 	}
+ 
+ 	if (open)
+@@ -508,7 +528,18 @@ qboolean CM_AreasConnected(int area1, int area2)
+ 
+ 	if (area1 >= cm.numAreas || area2 >= cm.numAreas)
+ 	{
++#ifdef __EMSCRIPTEN__
++		// A stray write during listen-server client init can corrupt cm.leafs[].area
++		// (the ~135KB leaf array at the bottom of the hunk gets partially overwritten
++		// with renderer vertex data). That feeds an out-of-range area here. On native
++		// this is fatal (ERR_DROP), which would disconnect the client and trigger a
++		// full Hunk_Clear that wipes the whole collision model. Degrade gracefully
++		// instead: treat as "not connected" so area/PVS culling is imperfect but the
++		// server stays up and physical collision (leafbrushes) keeps working.
++		return qfalse;
++#else
+ 		Com_Error(ERR_DROP, "CM_AreasConnected: area >= cm.numAreas");
++#endif
+ 	}
+ 
+ 	if (cm.areas[area1].floodnum == cm.areas[area2].floodnum)
+@@ -540,6 +571,14 @@ int CM_WriteAreaBits(byte *buffer, int area)
+ 	{
+ 		Com_Memset(buffer, 255, bytes);
+ 	}
++#ifdef __EMSCRIPTEN__
++	else if (area < 0 || area >= cm.numAreas)
++	{
++		// corrupt cm.leafs[].area (see CM_AreasConnected) can yield an out-of-range
++		// client area; send everything rather than reading out of bounds.
++		Com_Memset(buffer, 255, bytes);
++	}
++#endif
+ 	else
+ 	{
+ 		int i;
+diff --git a/src/qcommon/cm_trace.c b/src/qcommon/cm_trace.c
+index e5fa6af..b594c68 100644
+--- a/src/qcommon/cm_trace.c
++++ b/src/qcommon/cm_trace.c
+@@ -234,9 +234,18 @@ void CM_TestInLeaf(traceWork_t *tw, cLeaf_t *leaf)
+ 	cbrush_t *b;
+ 
+ 	// test box position against all brushes in the leaf
++#ifdef __EMSCRIPTEN__
++	if (leaf->numLeafBrushes < 0 || leaf->numLeafBrushes > cm.numLeafBrushes + 2)
++	{
++		return;
++	}
++#endif
+ 	for (k = 0 ; k < leaf->numLeafBrushes ; k++)
+ 	{
+ 		brushnum = cm.leafbrushes[leaf->firstLeafBrush + k];
++#ifdef __EMSCRIPTEN__
++		if (brushnum < 0 || brushnum >= cm.numBrushes + 1) { continue; }
++#endif
+ 		b        = &cm.brushes[brushnum];
+ 		if (b->checkcount == cm.checkcount)
+ 		{
+@@ -261,9 +270,23 @@ void CM_TestInLeaf(traceWork_t *tw, cLeaf_t *leaf)
+ 	{
+ 		cPatch_t *patch;
+ 
++#ifdef __EMSCRIPTEN__
++		if (leaf->numLeafSurfaces < 0 || leaf->numLeafSurfaces > cm.numLeafSurfaces + 2)
++		{
++			return;
++		}
++#endif
+ 		for (k = 0 ; k < leaf->numLeafSurfaces ; k++)
+ 		{
++#ifdef __EMSCRIPTEN__
++			{
++				int sn = cm.leafsurfaces[leaf->firstLeafSurface + k];
++				if (sn < 0 || sn >= cm.numSurfaces + 1) { continue; }
++				patch = cm.surfaces[sn];
++			}
++#else
+ 			patch = cm.surfaces[cm.leafsurfaces[leaf->firstLeafSurface + k]];
++#endif
+ 			if (!patch)
+ 			{
+ 				continue;
+@@ -816,11 +839,33 @@ static void CM_TraceThroughLeaf(traceWork_t *tw, cLeaf_t *leaf)
+ 	cbrush_t *brush;
+ 	float    fraction;
+ 
++#ifdef __EMSCRIPTEN__
++	// Defense in depth: a stray write during listen-server client init can corrupt
++	// the collision leaf structs (see CM_AreasConnected note in cm_test.c). A corrupt
++	// leaf can carry an out-of-range firstLeafBrush/numLeafBrush that would trap under
++	// wasm's strict bounds checking. Validate before use and skip bad entries.
++	if (leaf->numLeafBrushes < 0 || leaf->numLeafBrushes > cm.numLeafBrushes + 2)
++	{
++		return;
++	}
++#endif
++
+ 	// trace line against all brushes in the leaf
+ 	for (k = 0 ; k < leaf->numLeafBrushes ; k++)
+ 	{
+ 		// brushnum = cm.leafbrushes[leaf->firstLeafBrush + k];
++#ifdef __EMSCRIPTEN__
++		{
++			int bn = cm.leafbrushes[leaf->firstLeafBrush + k];
++			if (bn < 0 || bn >= cm.numBrushes + 1)
++			{
++				continue;
++			}
++			brush = &cm.brushes[bn];
++		}
++#else
+ 		brush = &cm.brushes[cm.leafbrushes[leaf->firstLeafBrush + k]];
++#endif
+ 		if (brush->checkcount == cm.checkcount)
+ 		{
+ 			continue;   // already checked this brush in another leaf
+@@ -860,9 +905,23 @@ static void CM_TraceThroughLeaf(traceWork_t *tw, cLeaf_t *leaf)
+ 	{
+ 		cPatch_t *patch;
+ 
++#ifdef __EMSCRIPTEN__
++		if (leaf->numLeafSurfaces < 0 || leaf->numLeafSurfaces > cm.numLeafSurfaces + 2)
++		{
++			return;
++		}
++#endif
+ 		for (k = 0 ; k < leaf->numLeafSurfaces ; k++)
+ 		{
++#ifdef __EMSCRIPTEN__
++			{
++				int sn = cm.leafsurfaces[leaf->firstLeafSurface + k];
++				if (sn < 0 || sn >= cm.numSurfaces + 1) { continue; }
++				patch = cm.surfaces[sn];
++			}
++#else
+ 			patch = cm.surfaces[cm.leafsurfaces[leaf->firstLeafSurface + k]];
++#endif
+ 			if (!patch)
+ 			{
+ 				continue;
+@@ -1409,6 +1468,10 @@ static void CM_Trace(trace_t *results, int *shaderNum, const vec3_t start, const
+ 	cmodel_t    *cmod;
+ 	qboolean    positionTest;
+ 
++#ifdef __EMSCRIPTEN__
++	CM_EMS_RestoreLeafsIfCorrupt();
++#endif
++
+ 	cmod = CM_ClipHandleToModel(model);
+ 
+ 	cm.checkcount++;        // for multi-check avoidance

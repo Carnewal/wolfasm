@@ -1,0 +1,50 @@
+diff --git a/src/qcommon/q_platform.h b/src/qcommon/q_platform.h
+index c0ad9cf..57c0a81 100644
+--- a/src/qcommon/q_platform.h
++++ b/src/qcommon/q_platform.h
+@@ -181,6 +181,23 @@
+ 
+ #endif
+ 
++//=========================================================== EMSCRIPTEN ===
++
++#if defined(__EMSCRIPTEN__)
++
++#define OS_STRING "emscripten"
++#define ID_INLINE inline
++#define PATH_SEP '/'
++
++#define ARCH_STRING "wasm32"
++
++// WebAssembly is always little endian
++#define Q3_LITTLE_ENDIAN
++
++#define DLL_EXT ".wasm"
++
++#endif
++
+ //================================================================= LINUX ===
+ 
+ #if defined(__linux__) || defined(__FreeBSD_kernel__)
+diff --git a/src/qcommon/q_shared.h b/src/qcommon/q_shared.h
+index fa16759..649e060 100644
+--- a/src/qcommon/q_shared.h
++++ b/src/qcommon/q_shared.h
+@@ -226,6 +226,17 @@
+ 
+ #endif // _WIN32
+ 
++//======================= EMSCRIPTEN DEFINES ============================
++
++#if defined(__EMSCRIPTEN__)
++
++// Keep a 2.60b-compatible CPUSTRING so the masked version string looks
++// like a normal client to real servers (see FAKE_VERSION).
++#define CPUSTRING   "linux-i386"
++#define PATH_SEP    '/'
++
++#endif // defined(__EMSCRIPTEN__)
++
+ //======================= MAC OS DEFINES =================================
+ 
+ #if defined(__APPLE__)

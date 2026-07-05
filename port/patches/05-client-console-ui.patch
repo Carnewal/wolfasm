@@ -1,0 +1,124 @@
+diff --git a/src/client/cl_main.c b/src/client/cl_main.c
+index 28b4bb5..3bf6d90 100644
+--- a/src/client/cl_main.c
++++ b/src/client/cl_main.c
+@@ -1034,6 +1034,13 @@ void CL_SendPureChecksums(void)
+ 	// if we are pure we need to send back a command with our referenced pk3 checksums
+ 	pChecksums = FS_ReferencedPakPureChecksums();
+ 
++#ifdef __EMSCRIPTEN__
++	Com_Printf("PURECHK sent cp: %s\n", pChecksums);
++	Com_Printf("PURECHK refNames: %s\n", FS_ReferencedPakNames());
++	Com_Printf("PURECHK sv_paks: %s\n", Cvar_VariableString("sv_paks"));
++	Com_Printf("PURECHK sv_pakNames: %s\n", Cvar_VariableString("sv_pakNames"));
++#endif
++
+ 	Com_sprintf(cMsg, sizeof(cMsg), "cp %d %s", cl.serverId, pChecksums);
+ 
+ 	CL_AddReliableCommand(cMsg);
+@@ -1059,6 +1066,13 @@ extern void Sys_In_Restart_f(void);
+  */
+ void CL_Vid_Restart_f(void)
+ {
++#ifdef __EMSCRIPTEN__
++	// Tearing down and recreating the WebGL context/window mid-run
++	// destabilises the browser main loop. The browser build pre-sets its
++	// video cvars, so vid_restart requests are ignored.
++	Com_Printf("vid_restart ignored (emscripten build)\n");
++	return;
++#endif
+ 	// don't show percent bar, since the memory usage will just sit at the same level anyway
+ 	// - so keep the value - feels like a bug for users
+ 	//com_expectedhunkusage = -1;
+diff --git a/src/client/cl_parse.c b/src/client/cl_parse.c
+index 9196a01..57831f9 100644
+--- a/src/client/cl_parse.c
++++ b/src/client/cl_parse.c
+@@ -969,6 +969,26 @@ void CL_ParseDownload(msg_t *msg)
+ 
+ 	if (cls.download.downloadBlock != block)
+ 	{
++#ifdef __EMSCRIPTEN__
++		// Over the WebSocket->UDP relay an ack can be lost on the bridge->server
++		// UDP hop. When that happens the server keeps re-sending the window of
++		// blocks we already have (block < downloadBlock) while we sit ahead of it.
++		// Our reliable "nextdl" may already be acknowledged, so it is no longer
++		// auto-resent and the transfer deadlocks. Re-issue the ack for our current
++		// position so the server advances. Rate-limit it (every 50ms) to avoid a
++		// reliable-command overflow when a whole window is re-sent at once, and
++		// throttle the log so it doesn't stall the browser console.
++		if (block >= 0 && block < cls.download.downloadBlock && cls.download.downloadBlock > 0)
++		{
++			static int lastReack = 0;
++			if (cls.realtime - lastReack >= 50 || lastReack == 0)
++			{
++				lastReack = cls.realtime;
++				CL_AddReliableCommand(va("nextdl %d", cls.download.downloadBlock - 1));
++			}
++			return;
++		}
++#endif
+ 		Com_Printf("CL_ParseDownload: Expected block %d, got %d\n", cls.download.downloadBlock, block);
+ 		return;
+ 	}
+diff --git a/src/client/cl_scrn.c b/src/client/cl_scrn.c
+index f26b96a..3c99a32 100644
+--- a/src/client/cl_scrn.c
++++ b/src/client/cl_scrn.c
+@@ -491,8 +491,20 @@ void SCR_DrawScreenField(void)
+ 
+ 	if (!uivm)
+ 	{
++#ifdef __EMSCRIPTEN__
++		// No UI VM in the browser build: draw a full-screen engine console so
++		// there is a visible, interactive surface instead of a black screen.
++		// Use the solid console directly (bypasses the open/close animation
++		// that never runs without the menu driving it).
++		{
++			extern void Con_DrawSolidConsole(float frac);
++			Con_DrawSolidConsole(1.0f);
++		}
++		return;
++#else
+ 		Com_DPrintf("draw screen without UI loaded\n");
+ 		return;
++#endif
+ 	}
+ 
+ 	// if the menu is going to cover the entire screen, we
+diff --git a/src/client/cl_ui.c b/src/client/cl_ui.c
+index 8749074..89b71d0 100644
+--- a/src/client/cl_ui.c
++++ b/src/client/cl_ui.c
+@@ -1396,7 +1396,17 @@ void CL_InitUI(void)
+ 	uivm = VM_Create("ui", qtrue, CL_UISystemCalls, VMI_NATIVE);
+ 	if (!uivm)
+ 	{
++#ifdef __EMSCRIPTEN__
++		// No native UI module can be dlopen'd in the browser and retail ET
++		// ships no ui.qvm. Rather than abort, keep the engine alive and open
++		// the built-in console so there is a visible, interactive surface.
++		Com_Printf("^3WARNING: UI VM could not be loaded; running without menu. Opening console.\n");
++		cls.keyCatchers |= KEYCATCH_CONSOLE;
++		Con_ToggleConsole_f();
++		return;
++#else
+ 		VM_Error(ERR_FATAL, "ui", Sys_GetDLLName("ui"));
++#endif
+ 	}
+ 
+ 	// sanity check
+diff --git a/src/client/client.h b/src/client/client.h
+index f96a346..04ff440 100644
+--- a/src/client/client.h
++++ b/src/client/client.h
+@@ -834,8 +834,8 @@ void DB_InsertFavorite(const char *profile, int source, const char *name, const
+ void DB_DeleteFavorite(const char *profile, const char *address);
+ void DB_UpdateFavorite(const char *profile, const char *address);
+ void DB_LoadFavorites(const char *profile);
++#endif
+ 
+ void CL_InitServerInfo(serverInfo_t *server, const netadr_t *address);
+-#endif
+ 
+ #endif // #ifndef INCLUDE_CLIENT_H

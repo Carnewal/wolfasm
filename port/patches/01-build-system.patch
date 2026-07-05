@@ -1,0 +1,336 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 38a5b13..1c304f3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -177,7 +177,11 @@ include(cmake/ETLVersion.cmake)
+ 
+ # Use bundled libraries
+ if(BUNDLED_LIBS)
+-	include(cmake/ETLBundledLibs.cmake)
++	if(EMSCRIPTEN)
++		include(cmake/ETLEmscripten.cmake)
++	else()
++		include(cmake/ETLBundledLibs.cmake)
++	endif()
+ endif(BUNDLED_LIBS)
+ 
+ # Set up includes and libraries based on feature options
+diff --git a/cmake/ETLBuildClient.cmake b/cmake/ETLBuildClient.cmake
+index ba1db29..f16368e 100644
+--- a/cmake/ETLBuildClient.cmake
++++ b/cmake/ETLBuildClient.cmake
+@@ -63,7 +63,15 @@ set_target_properties(etl PROPERTIES
+ 	MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/misc/Info.plist
+ )
+ 
+-if((UNIX OR ETL_ARM) AND NOT APPLE AND NOT ANDROID)
++if(EMSCRIPTEN)
++	# Emit an integrated HTML page (etl.html + etl.js + etl.wasm) using our shell.
++	set_target_properties(etl PROPERTIES SUFFIX ".html")
++	target_link_options(etl PRIVATE
++		"SHELL:--shell-file ${CMAKE_SOURCE_DIR}/../web/shell.html"
++		# Load cgame/ui/qagame as dlopen'd SIDE_MODULEs at runtime.
++		"-sMAIN_MODULE=1"
++	)
++elseif((UNIX OR ETL_ARM) AND NOT APPLE AND NOT ANDROID)
+ 	set_target_properties(etl PROPERTIES SUFFIX "${BIN_SUFFIX}")
+ endif()
+ 
+diff --git a/cmake/ETLBuildMod.cmake b/cmake/ETLBuildMod.cmake
+index 075dae7..bb849ab 100644
+--- a/cmake/ETLBuildMod.cmake
++++ b/cmake/ETLBuildMod.cmake
+@@ -20,6 +20,21 @@ function(etl_enforce_linux_mod_no_undefined target_name)
+ 	endif()
+ endfunction()
+ 
++# Build a VM module as an Emscripten SIDE_MODULE (.wasm) that the MAIN_MODULE
++# engine dlopen()s at runtime. Only vmMain/dllEntry need to be reachable; the
++# module talks to the engine solely through the passed syscall pointer.
++function(etl_emscripten_side_module target_name)
++	if(EMSCRIPTEN)
++		set_target_properties(${target_name} PROPERTIES SUFFIX ".wasm")
++		target_compile_options(${target_name} PRIVATE "-fPIC")
++		target_link_options(${target_name} PRIVATE
++			"-sSIDE_MODULE=1"
++			"-fPIC"
++			"SHELL:-sEXPORTED_FUNCTIONS=['_vmMain','_dllEntry']"
++		)
++	endif()
++endfunction()
++
+ #
+ # cgame
+ #
+@@ -39,6 +54,7 @@ if(BUILD_CLIENT_MOD)
+ 		LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${MODNAME}"
+ 	)
+ 	target_compile_definitions(cgame PRIVATE CGAMEDLL=1 MODLIB=1)
++	etl_emscripten_side_module(cgame)
+ endif()
+ 
+ #
+@@ -60,6 +76,7 @@ if(BUILD_CLIENT_MOD)
+ 		LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${MODNAME}"
+ 	)
+ 	target_compile_definitions(ui PRIVATE UIDLL=1 MODLIB=1)
++	etl_emscripten_side_module(ui)
+ endif()
+ 
+ #
+@@ -107,6 +124,12 @@ if(BUILD_SERVER_MOD)
+ 		RUNTIME_OUTPUT_DIRECTORY_RELEASE "${MODNAME}"
+ 	)
+ 	target_compile_definitions(qagame PRIVATE GAMEDLL=1 MODLIB=1)
++	etl_emscripten_side_module(qagame)
++	if(EMSCRIPTEN)
++		# rating/prestige code (#included in QAGAME_SRC) uses sqlite directly.
++		target_link_libraries(qagame bundled_sqlite3)
++		target_compile_definitions(qagame PRIVATE FEATURE_DBMS)
++	endif()
+ endif()
+ 
+ #
+diff --git a/cmake/ETLEmscripten.cmake b/cmake/ETLEmscripten.cmake
+new file mode 100644
+index 0000000..9a842e4
+--- /dev/null
++++ b/cmake/ETLEmscripten.cmake
+@@ -0,0 +1,130 @@
++#-----------------------------------------------------------------
++# Emscripten / WebAssembly build support
++#
++# Replaces cmake/ETLBundledLibs.cmake for the EMSCRIPTEN target.
++# Instead of building the bundled libs via ExternalProject, we back the
++# `bundled_*` ghost targets with Emscripten ports (SDL2, zlib, libjpeg)
++# and a couple of tiny vendored static libs (minizip, cJSON).
++#-----------------------------------------------------------------
++
++message(STATUS "Configuring bundled libraries for Emscripten (ports + vendored)")
++
++# Dynamic linking (MAIN_MODULE engine + SIDE_MODULE mods) requires every object
++# — engine, mods, and all bundled static libs — to be position independent.
++set(CMAKE_POSITION_INDEPENDENT_CODE ON)
++set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
++
++# Match the mod filenames (cgame.mp.<ARCH>.wasm) to what the engine's
++# Sys_GetDLLName builds from ARCH_STRING ("wasm32", see q_platform.h).
++set(ARCH "wasm32")
++
++set(EMS_LIBS_DIR "${CMAKE_SOURCE_DIR}/libs")
++
++#-----------------------------------------------------------------
++# Emscripten port flags (needed at BOTH compile and link time)
++#-----------------------------------------------------------------
++# SDL2
++add_library(bundled_sdl_int INTERFACE)
++target_compile_options(bundled_sdl_int INTERFACE "-sUSE_SDL=2")
++target_link_options(bundled_sdl_int INTERFACE "-sUSE_SDL=2")
++
++# zlib
++add_library(bundled_zlib INTERFACE)
++target_compile_options(bundled_zlib INTERFACE "-sUSE_ZLIB=1")
++target_link_options(bundled_zlib INTERFACE "-sUSE_ZLIB=1")
++
++# libjpeg
++add_library(bundled_jpeg_int INTERFACE)
++target_compile_options(bundled_jpeg_int INTERFACE "-sUSE_LIBJPEG=1")
++target_link_options(bundled_jpeg_int INTERFACE "-sUSE_LIBJPEG=1")
++
++#-----------------------------------------------------------------
++# minizip (vendored static lib) - pk3 (zip) reading
++#-----------------------------------------------------------------
++add_library(bundled_minizip STATIC
++	"${EMS_LIBS_DIR}/minizip/ioapi.c"
++	"${EMS_LIBS_DIR}/minizip/unzip.c"
++	"${EMS_LIBS_DIR}/minizip/zip.c"
++)
++target_include_directories(bundled_minizip PUBLIC "${EMS_LIBS_DIR}/minizip")
++# minizip needs zlib.h (from the zlib port) at compile time
++target_compile_options(bundled_minizip PRIVATE "-sUSE_ZLIB=1")
++target_link_libraries(bundled_minizip PUBLIC bundled_zlib)
++set_target_properties(bundled_minizip PROPERTIES FOLDER ${BUNDLED_TARGETS_FOLDER})
++
++#-----------------------------------------------------------------
++# cJSON (vendored static lib)
++#-----------------------------------------------------------------
++add_library(bundled_cjson STATIC
++	"${EMS_LIBS_DIR}/cjson/cJSON.c"
++)
++# engine's json wrapper includes <cjson/cJSON.h>, so expose the libs root
++target_include_directories(bundled_cjson PUBLIC "${EMS_LIBS_DIR}")
++
++#-----------------------------------------------------------------
++# sqlite3 (vendored static lib) - used by FEATURE_DBMS / rating / prestige
++#-----------------------------------------------------------------
++add_library(bundled_sqlite3 STATIC
++	"${EMS_LIBS_DIR}/sqlite3/src/sqlite3.c"
++)
++target_include_directories(bundled_sqlite3 PUBLIC "${EMS_LIBS_DIR}/sqlite3/src")
++target_compile_definitions(bundled_sqlite3 PRIVATE
++	SQLITE_THREADSAFE=0
++	SQLITE_OMIT_LOAD_EXTENSION=1
++)
++set_target_properties(bundled_sqlite3 PROPERTIES FOLDER ${BUNDLED_TARGETS_FOLDER})
++# qagame's rating/prestige code uses sqlite directly; ensure it gets the header
++# and lib (stock CMake only links it for the LuaSQL path).
++target_link_libraries(qagame_libraries INTERFACE bundled_sqlite3)
++set_target_properties(bundled_cjson PROPERTIES FOLDER ${BUNDLED_TARGETS_FOLDER})
++
++#-----------------------------------------------------------------
++# Renderer GLES: ET:L's GLES renderer is fixed-function (GLES 1.1). WebGL
++# has no fixed-function pipeline, so we rely on Emscripten's
++# LEGACY_GL_EMULATION (see link flags below) plus a small shim for the few
++# entry points it does not provide (glClipPlanef).
++#-----------------------------------------------------------------
++add_library(bundled_glshim STATIC
++	"${CMAKE_SOURCE_DIR}/src/sys/emscripten_gl_shim.c"
++)
++set_target_properties(bundled_glshim PROPERTIES FOLDER ${BUNDLED_TARGETS_FOLDER})
++# fixed-function symbols are pulled from a static archive, so force whole-archive
++target_link_libraries(renderer_gles_libraries INTERFACE bundled_glshim)
++
++#-----------------------------------------------------------------
++# WebSocket networking transport (browser has no UDP). net_ip.c calls into
++# this; it tunnels ET datagrams to bridge/etl-ws-bridge.js.
++#-----------------------------------------------------------------
++target_sources(engine_libraries INTERFACE "${CMAKE_SOURCE_DIR}/src/sys/net_emscripten.c")
++
++#-----------------------------------------------------------------
++# Global Emscripten link settings for the final executable(s).
++# These are appended to the exe linker flags; per-lib port flags come
++# from the ghost targets above.
++#-----------------------------------------------------------------
++set(ETL_EMS_LINK_FLAGS
++	"-sUSE_SDL=2"
++	"-sUSE_ZLIB=1"
++	"-sUSE_LIBJPEG=1"
++	# ET:L's GLES renderer is fixed-function (GLES 1.1); emulate it on WebGL.
++	"-sLEGACY_GL_EMULATION=1"
++	"-sGL_UNSAFE_OPTS=0"
++	# NOTE: do NOT enable ALLOW_MEMORY_GROWTH — a growable heap yields a
++	# resizable ArrayBuffer, and Chrome's WebGL rejects texture/buffer data
++	# views over resizable buffers ("ArrayBufferView must not be resizable").
++	# Use a large fixed heap instead.
++	"-sINITIAL_MEMORY=2147483648"
++	"-sFORCE_FILESYSTEM=1"
++	"-sSTACK_SIZE=5242880"
++	"-sEXIT_RUNTIME=0"
++	"-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','FS','callMain']"
++	"-sERROR_ON_UNDEFINED_SYMBOLS=1"
++	"-lidbfs.js"
++	"-lwebsocket.js"
++)
++string(REPLACE ";" " " ETL_EMS_LINK_FLAGS_STR "${ETL_EMS_LINK_FLAGS}")
++set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${ETL_EMS_LINK_FLAGS_STR}")
++
++# Emit an HTML shell + JS + WASM
++set(CMAKE_EXECUTABLE_SUFFIX ".html")
+diff --git a/cmake/ETLPlatform.cmake b/cmake/ETLPlatform.cmake
+index a92266d..6fb28c2 100644
+--- a/cmake/ETLPlatform.cmake
++++ b/cmake/ETLPlatform.cmake
+@@ -96,7 +96,12 @@ if(UNIX)
+ 		endif()
+ 	endif()
+ 
+-	if(CMAKE_SYSTEM MATCHES "OpenBSD*")
++	if(EMSCRIPTEN)
++		# Emscripten: libm is built in; no rt/pthread/dl needed for a
++		# single-threaded WebAssembly build.
++		target_link_libraries(os_libraries INTERFACE m)
++		set(LIB_SUFFIX ".mp.")
++	elseif(CMAKE_SYSTEM MATCHES "OpenBSD*")
+ 		target_link_libraries(os_libraries INTERFACE m pthread)
+ 		set(LIB_SUFFIX ".mp.obsd.")
+ 	elseif(CMAKE_SYSTEM MATCHES "FreeBSD")
+diff --git a/cmake/ETLSetupFeatures.cmake b/cmake/ETLSetupFeatures.cmake
+index a0b2fff..3fa4a08 100644
+--- a/cmake/ETLSetupFeatures.cmake
++++ b/cmake/ETLSetupFeatures.cmake
+@@ -10,7 +10,7 @@ set(SRC "${PROJECT_SOURCE_DIR}/src")
+ #-----------------------------------------------------------------
+ if(BUILD_CLIENT)
+ 
+-	if(NOT WIN32 AND NOT APPLE AND NOT ANDROID) # Dependency of GLEW and SDL_syswm.h
++	if(NOT WIN32 AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN) # Dependency of GLEW and SDL_syswm.h
+ 		find_package(X11 REQUIRED)
+ 		target_include_directories(client_libraries INTERFACE ${X11_INCLUDE_DIR})
+ 	endif()
+@@ -73,9 +73,14 @@ if(BUILD_CLIENT)
+ 	endif()
+ 
+ 	if(FEATURE_RENDERER_GLES)
+-		find_package(GLES REQUIRED)
+-		target_link_libraries(renderer_gles_libraries INTERFACE ${GLES_LIBRARY})
+-		target_include_directories(renderer_gles_libraries INTERFACE ${GLES_INCLUDE_DIR})
++		if(EMSCRIPTEN)
++			# Emscripten provides GLES2/GLES3 headers in the sysroot and the
++			# WebGL context via SDL; no separate GLES lib to find/link.
++		else()
++			find_package(GLES REQUIRED)
++			target_link_libraries(renderer_gles_libraries INTERFACE ${GLES_LIBRARY})
++			target_include_directories(renderer_gles_libraries INTERFACE ${GLES_INCLUDE_DIR})
++		endif()
+ 	endif()
+ 
+ 	if(FEATURE_RENDERER_VULKAN)
+@@ -233,6 +238,10 @@ if(BUILD_CLIENT OR BUILD_SERVER)
+ 		target_sources(engine_libraries INTERFACE "${SRC}/qcommon/dl_main_curl.c")
+ 	elseif(ANDROID)
+ 		target_sources(engine_libraries INTERFACE "${SRC}/qcommon/dl_main_android.c")
++	elseif(EMSCRIPTEN)
++		# Browser HTTP downloads are proxied through the WebSocket bridge's /dl
++		# endpoint (no libcurl, and cross-origin fetch is blocked by CORS).
++		target_sources(engine_libraries INTERFACE "${SRC}/sys/dl_emscripten.c")
+ 	else()
+ 		target_sources(engine_libraries INTERFACE "${SRC}/qcommon/dl_main_stubs.c")
+ 	endif()
+diff --git a/emscripten_build.ps1 b/emscripten_build.ps1
+new file mode 100644
+index 0000000..0baf44b
+--- /dev/null
++++ b/emscripten_build.ps1
+@@ -0,0 +1,13 @@
++# Build the ET:Legacy WebAssembly client. Pass a target as $args[0] (default: all).
++$m=[System.Environment]::GetEnvironmentVariable("Path","Machine")
++$u=[System.Environment]::GetEnvironmentVariable("Path","User")
++$env:Path="$m;$u"
++$env:EMSDK_QUIET=1
++. "C:\Users\carnewal\Documents\wolfasm\emsdk\emsdk_env.ps1" | Out-Null
++Set-Location "C:\Users\carnewal\Documents\wolfasm\etlegacy"
++$target = if ($args.Count -gt 0) { $args[0] } else { "" }
++if ($target) {
++  cmake --build build-wasm --target $target -j 8
++} else {
++  cmake --build build-wasm -j 8
++}
+diff --git a/emscripten_configure.ps1 b/emscripten_configure.ps1
+new file mode 100644
+index 0000000..a086a23
+--- /dev/null
++++ b/emscripten_configure.ps1
+@@ -0,0 +1,22 @@
++# Configure ET:Legacy for a minimal WebAssembly client build.
++$m=[System.Environment]::GetEnvironmentVariable("Path","Machine")
++$u=[System.Environment]::GetEnvironmentVariable("Path","User")
++$env:Path="$m;$u"
++$env:EMSDK_QUIET=1
++. "C:\Users\carnewal\Documents\wolfasm\emsdk\emsdk_env.ps1" | Out-Null
++Set-Location "C:\Users\carnewal\Documents\wolfasm\etlegacy"
++
++emcmake cmake -S . -B build-wasm -G Ninja `
++  -DCMAKE_BUILD_TYPE=Debug `
++  -DBUILD_SERVER=OFF -DBUILD_CLIENT=ON `
++  -DBUILD_MOD=ON -DBUILD_CLIENT_MOD=ON -DBUILD_SERVER_MOD=ON -DBUILD_MOD_PK3=OFF `
++  -DFEATURE_LUA=OFF -DFEATURE_OMNIBOT=OFF `
++  -DBUNDLED_LIBS=ON `
++  -DRENDERER_DYNAMIC=OFF `
++  -DFEATURE_RENDERER1=OFF -DFEATURE_RENDERER2=OFF -DFEATURE_RENDERER_GLES=ON -DFEATURE_RENDERER_VULKAN=OFF `
++  -DFEATURE_CURL=OFF -DFEATURE_SSL=OFF -DFEATURE_AUTH=OFF -DFEATURE_IPV6=OFF `
++  -DFEATURE_OGG_VORBIS=OFF -DFEATURE_THEORA=OFF -DFEATURE_OPENAL=OFF `
++  -DFEATURE_FREETYPE=OFF -DFEATURE_PNG=OFF -DFEATURE_DBMS=ON `
++  -DFEATURE_AUTOUPDATE=OFF -DFEATURE_IRC_CLIENT=OFF `
++  -DCROSS_COMPILE32=OFF -DENABLE_MULTI_BUILD=OFF `
++  -DINSTALL_EXTRA=OFF

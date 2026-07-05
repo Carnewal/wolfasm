@@ -1,0 +1,106 @@
+diff --git a/src/rendererGLES/tr_image.c b/src/rendererGLES/tr_image.c
+index aca0447..0ebc4e3 100644
+--- a/src/rendererGLES/tr_image.c
++++ b/src/rendererGLES/tr_image.c
+@@ -34,6 +34,13 @@
+ 
+ #include "tr_local.h"
+ 
++#ifdef __EMSCRIPTEN__
++// The GLES 1.1 header (GLES/gl.h) does not declare the GLES2/WebGL entry point
++// glGenerateMipmap, which we use to build mip chains (GL_GENERATE_MIPMAP is not
++// available under WebGL). Emscripten provides the symbol at link time.
++extern void glGenerateMipmap(GLenum target);
++#endif
++
+ static byte          s_intensitytable[256];
+ static unsigned char s_gammatable[256];
+ 
+@@ -831,7 +838,13 @@ static void Upload32(unsigned *data,
+ 	}
+ 	R_LightScaleTexture(scaledBuffer, scaled_width, scaled_height, !mipmap);
+ 
++#ifndef __EMSCRIPTEN__
++	// GLES 1.1 auto-mipmap-on-upload. This token does not exist in WebGL/GLES2,
++	// where it is an invalid enum (and a no-op), so the mip chain would never be
++	// built -> the texture is incomplete under a mipmapping min-filter and samples
++	// black. We generate mipmaps explicitly with glGenerateMipmap() below instead.
+ 	glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP, (mipmap) ? GL_TRUE : GL_FALSE);
++#endif
+ 
+ 	// and now, convert if needed and upload
+ 	// GLES doesn't do conversion itself, so we have to handle that
+@@ -869,6 +882,17 @@ static void Upload32(unsigned *data,
+ 		break;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// WebGL/GLES2 has no GL_GENERATE_MIPMAP; build the mip chain explicitly from
++	// the level-0 image we just uploaded. Textures are already scaled to a power
++	// of two above, so glGenerateMipmap is valid here. Without this the texture is
++	// incomplete under GL_LINEAR_MIPMAP_* and samples black (black/untextured world).
++	if (mipmap)
++	{
++		glGenerateMipmap(GL_TEXTURE_2D);
++	}
++#endif
++
+ 	*pUploadWidth  = scaled_width;
+ 	*pUploadHeight = scaled_height;
+ 	*format        = internalFormat;
+diff --git a/src/rendererGLES/tr_init.c b/src/rendererGLES/tr_init.c
+index de6ef55..d05b095 100644
+--- a/src/rendererGLES/tr_init.c
++++ b/src/rendererGLES/tr_init.c
+@@ -195,6 +195,15 @@ static void InitOpenGL(void)
+ 
+ 		char glConfigString[1024] = { 0 };
+ 		Info_SetValueForKey(glConfigString, "type", "opengl");
++#ifdef __EMSCRIPTEN__
++		// WebGL exposes no GLES 1.x context; the fixed-function GLES1 calls are
++		// serviced by Emscripten's LEGACY_GL_EMULATION on top of a WebGL1
++		// (GLES 2.0) context, so request ES 2.0 and no multisampling.
++		Info_SetValueForKey(glConfigString, "major", "2");
++		Info_SetValueForKey(glConfigString, "minor", "0");
++		Info_SetValueForKey(glConfigString, "samples", "0");
++		Info_SetValueForKey(glConfigString, "context", va("%i", GL_CONTEXT_EGL));
++#else
+ 		Info_SetValueForKey(glConfigString, "major", "1");
+ 		Info_SetValueForKey(glConfigString, "minor", "1");
+ 
+@@ -206,6 +215,7 @@ static void InitOpenGL(void)
+ 		Info_SetValueForKey(glConfigString, "context", va("%i", GL_CONTEXT_EGL));
+ #else
+ 		Info_SetValueForKey(glConfigString, "context", va("%i", GL_CONTEXT_ES));
++#endif
+ #endif
+ 
+ 		ri.GLimp_Init(&glConfig, glConfigString);
+diff --git a/src/sys/emscripten_gl_shim.c b/src/sys/emscripten_gl_shim.c
+new file mode 100644
+index 0000000..83f5314
+--- /dev/null
++++ b/src/sys/emscripten_gl_shim.c
+@@ -0,0 +1,22 @@
++/**
++ * @file emscripten_gl_shim.c
++ * @brief Fixed-function GL entry points that ET:L's GLES1 renderer uses but
++ *        that Emscripten's LEGACY_GL_EMULATION does not provide.
++ *
++ * WebGL has no user clip planes, so glClipPlanef is a no-op here. The effect
++ * is that portal/mirror surfaces are not hard-clipped by the near plane; the
++ * rest of the scene renders normally.
++ */
++
++#ifdef __EMSCRIPTEN__
++
++typedef unsigned int GLenum;
++typedef float        GLfloat;
++
++void glClipPlanef(GLenum plane, const GLfloat *equation)
++{
++	(void)plane;
++	(void)equation;
++}
++
++#endif /* __EMSCRIPTEN__ */

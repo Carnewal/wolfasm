@@ -1,0 +1,32 @@
+--- a/src/lib/libglemu.js
++++ b/src/lib/libglemu.js
+@@ -2835,6 +2835,29 @@
+         }
+         glGetIntegerv(pname, params);
+       };
++
++      // --- ET:Legacy wasm port fix -------------------------------------------
++      // In a MAIN_MODULE build, a SIDE_MODULE that imports any of the GL
++      // functions reassigned above hits reportUndefinedSymbols -> addFunction,
++      // which (under ASSERTIONS) requires the function to carry a `.sig`. The
++      // GLEmulation.init() block above preserves sigs via copySigs(); this
++      // setupHooks() block predates that and dropped them, aborting boot with
++      // "Missing signature argument to addFunction". Restore the sigs from the
++      // saved originals, with GL-correct fallbacks for the fixed-function
++      // glTexEnv* wrappers (which have no real WebGL/GLES2 original).
++      var __emsPortSig = (fn, emfn, saved, fallback) => {
++        var s = (saved && saved.sig) || fallback;
++        if (fn) fn.sig = s;
++        if (emfn) emfn.sig = s;
++      };
++      __emsPortSig(_glActiveTexture, _emscripten_glActiveTexture, glActiveTexture, 'vi');
++      __emsPortSig(_glEnable,        _emscripten_glEnable,        glEnable,        'vi');
++      __emsPortSig(_glDisable,       _emscripten_glDisable,       glDisable,       'vi');
++      __emsPortSig(_glTexEnvf,       _emscripten_glTexEnvf,       glTexEnvf,       'viif');
++      __emsPortSig(_glTexEnvi,       _emscripten_glTexEnvi,       glTexEnvi,       'viii');
++      __emsPortSig(_glTexEnvfv,      _emscripten_glTexEnvfv,      glTexEnvfv,      'viii');
++      __emsPortSig(_glGetIntegerv,   _emscripten_glGetIntegerv,   glGetIntegerv,   'vii');
++      // -----------------------------------------------------------------------
+     },
+ 
+     // Main functions

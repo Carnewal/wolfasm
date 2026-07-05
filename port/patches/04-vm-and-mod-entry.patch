@@ -1,0 +1,58 @@
+diff --git a/src/cgame/cg_main.c b/src/cgame/cg_main.c
+index 8e5faef..8b7fc04 100644
+--- a/src/cgame/cg_main.c
++++ b/src/cgame/cg_main.c
+@@ -69,7 +69,7 @@ int dll_trap_CvarSetDescription;
+  * @param[in] arg11 - unused
+  * @return
+  */
+-Q_EXPORT intptr_t vmMain(intptr_t command, intptr_t arg0, intptr_t arg1, intptr_t arg2, intptr_t arg3, intptr_t arg4, intptr_t arg5, intptr_t arg6, intptr_t arg7, intptr_t arg8, intptr_t arg9, intptr_t arg10, intptr_t arg11)
++Q_EXPORT intptr_t vmMain(intptr_t command, intptr_t arg0, intptr_t arg1, intptr_t arg2, intptr_t arg3, intptr_t arg4, intptr_t arg5, intptr_t arg6, intptr_t arg7, intptr_t arg8, intptr_t arg9, intptr_t arg10, intptr_t arg11, intptr_t arg12, intptr_t arg13, intptr_t arg14, intptr_t arg15)
+ {
+ 	switch (command)
+ 	{
+diff --git a/src/game/g_main.c b/src/game/g_main.c
+index 75de5cb..452c2d9 100644
+--- a/src/game/g_main.c
++++ b/src/game/g_main.c
+@@ -152,7 +152,7 @@ static qboolean G_SnapshotCallback(int entityNum, int clientNum)
+  * @param arg6 - unused
+  * @return
+  */
+-Q_EXPORT intptr_t vmMain(intptr_t command, intptr_t arg0, intptr_t arg1, intptr_t arg2, intptr_t arg3, intptr_t arg4, intptr_t arg5, intptr_t arg6)
++Q_EXPORT intptr_t vmMain(intptr_t command, intptr_t arg0, intptr_t arg1, intptr_t arg2, intptr_t arg3, intptr_t arg4, intptr_t arg5, intptr_t arg6, intptr_t arg7, intptr_t arg8, intptr_t arg9, intptr_t arg10, intptr_t arg11, intptr_t arg12, intptr_t arg13, intptr_t arg14, intptr_t arg15)
+ {
+ 	switch (command)
+ 	{
+diff --git a/src/qcommon/vm.c b/src/qcommon/vm.c
+index dd62625..9db6b53 100644
+--- a/src/qcommon/vm.c
++++ b/src/qcommon/vm.c
+@@ -742,7 +742,14 @@ intptr_t QDECL VM_CallFunc(vm_t *vm, int callNum, ...)
+ 
+ 	if (!vm)
+ 	{
++#ifdef __EMSCRIPTEN__
++		// The browser build can run without client VMs (no ui/cgame module).
++		// Treat calls into a missing VM as harmless no-ops instead of a fatal
++		// error, so the engine stays alive (e.g. at the console).
++		return 0;
++#else
+ 		Com_Error(ERR_FATAL, "VM_Call: NULL vm");
++#endif
+ 	}
+ 
+ 	oldVM     = currentVM;
+diff --git a/src/ui/ui_main.c b/src/ui/ui_main.c
+index f54bace..8b23ca4 100644
+--- a/src/ui/ui_main.c
++++ b/src/ui/ui_main.c
+@@ -155,7 +155,7 @@ static uiMenuCommand_t UI_AdjustedMenuCommand(const uiMenuCommand_t menutype)
+  * @param[in] arg11 - unused
+  * @return
+  */
+-Q_EXPORT intptr_t vmMain(intptr_t command, intptr_t arg0, intptr_t arg1, intptr_t arg2, intptr_t arg3, intptr_t arg4, intptr_t arg5, intptr_t arg6, intptr_t arg7, intptr_t arg8, intptr_t arg9, intptr_t arg10, intptr_t arg11)
++Q_EXPORT intptr_t vmMain(intptr_t command, intptr_t arg0, intptr_t arg1, intptr_t arg2, intptr_t arg3, intptr_t arg4, intptr_t arg5, intptr_t arg6, intptr_t arg7, intptr_t arg8, intptr_t arg9, intptr_t arg10, intptr_t arg11, intptr_t arg12, intptr_t arg13, intptr_t arg14, intptr_t arg15)
+ {
+ 	switch (command)
+ 	{

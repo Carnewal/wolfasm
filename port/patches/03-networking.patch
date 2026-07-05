@@ -1,0 +1,416 @@
+diff --git a/src/qcommon/net_ip.c b/src/qcommon/net_ip.c
+index db163ec..1136ef4 100644
+--- a/src/qcommon/net_ip.c
++++ b/src/qcommon/net_ip.c
+@@ -475,11 +475,92 @@ static void Sys_SockaddrToString(char *dest, size_t destlen, struct sockaddr *in
+  * @param[in] family
+  * @return
+  */
++#ifdef __EMSCRIPTEN__
++// WebSocket transport (src/sys/net_emscripten.c) — tunnels ET datagrams to the
++// bridge which performs the real UDP send/recv.
++void NET_EMS_Init(const char *url);
++void NET_EMS_Send(const unsigned char ip[4], unsigned short port, const void *data, int len);
++int  NET_EMS_Recv(unsigned char ip[4], unsigned short *port, void *buf, int maxlen);
++
++// Parse "a.b.c.d" or "a.b.c.d:port" into a NA_IP netadr. Returns qtrue on match.
++// Numeric only: the browser cannot resolve hostnames to real UDP peers, so we
++// keep the real IP in the address instead of an Emscripten virtual IP.
++static qboolean NET_EMS_ParseIPv4(const char *s, netadr_t *a)
++{
++	unsigned int o0, o1, o2, o3, port = 0;
++	int          n;
++
++	n = sscanf(s, "%u.%u.%u.%u:%u", &o0, &o1, &o2, &o3, &port);
++	if (n < 4 || o0 > 255 || o1 > 255 || o2 > 255 || o3 > 255 || port > 65535)
++	{
++		return qfalse;
++	}
++	Com_Memset(a, 0, sizeof(*a));
++	a->type  = NA_IP;
++	a->ip[0] = (byte)o0;
++	a->ip[1] = (byte)o1;
++	a->ip[2] = (byte)o2;
++	a->ip[3] = (byte)o3;
++	a->port  = BigShort((short)port);
++	return qtrue;
++}
++
++// Resolve the handful of ET:Legacy infrastructure hostnames the client uses to
++// their real IPs. The browser cannot DNS-resolve to real UDP peers (Emscripten
++// hands back unusable virtual IPs), so map them here. Game servers are always
++// numeric (from the master's getserversResponse) and go through the parser above.
++static qboolean NET_EMS_ResolveKnownHost(const char *s, netadr_t *a)
++{
++	static const struct { const char *name; const char *ip; unsigned short port; } hosts[] =
++	{
++		{ "master.etlegacy.com", "104.248.140.165", 27950 },
++		{ "motd.etlegacy.com",   "104.248.140.165", 27951 },
++	};
++	char        host[128];
++	const char  *colon = strchr(s, ':');
++	unsigned int port  = 0;
++	size_t       hlen  = colon ? (size_t)(colon - s) : strlen(s);
++	int          i;
++
++	if (hlen >= sizeof(host))
++	{
++		return qfalse;
++	}
++	memcpy(host, s, hlen);
++	host[hlen] = '\0';
++	if (colon)
++	{
++		port = (unsigned int)atoi(colon + 1);
++	}
++
++	for (i = 0; i < (int)(sizeof(hosts) / sizeof(hosts[0])); i++)
++	{
++		if (!Q_stricmp(host, hosts[i].name))
++		{
++			char buf[48];
++			Com_sprintf(buf, sizeof(buf), "%s:%u", hosts[i].ip, port ? port : hosts[i].port);
++			return NET_EMS_ParseIPv4(buf, a);
++		}
++	}
++	return qfalse;
++}
++#endif
++
+ qboolean Sys_StringToAdr(const char *s, netadr_t *a, netadrtype_t family)
+ {
+ 	struct sockaddr_storage sadr;
+ 	sa_family_t             fam;
+ 
++#ifdef __EMSCRIPTEN__
++	// Prefer a direct numeric parse so real server IPs survive (getaddrinfo
++	// under Emscripten would hand back an unusable virtual IP), then fall back
++	// to the known-hostname table (master/motd servers).
++	if (NET_EMS_ParseIPv4(s, a) || NET_EMS_ResolveKnownHost(s, a))
++	{
++		return qtrue;
++	}
++#endif
++
+ 	switch (family)
+ 	{
+ 	case NA_IP:
+@@ -756,6 +837,28 @@ qboolean NET_GetPacket(netadr_t *net_from, msg_t *net_message, fd_set *fdr)
+ 	socklen_t               fromlen;
+ 	int                     err;
+ 
++#ifdef __EMSCRIPTEN__
++	{
++		unsigned char  fip[4];
++		unsigned short fport = 0;
++		int            n     = NET_EMS_Recv(fip, &fport, net_message->data, net_message->maxsize);
++		if (n < 0)
++		{
++			return qfalse; // nothing queued this frame
++		}
++		Com_Memset(net_from, 0, sizeof(*net_from));
++		net_from->type  = NA_IP;
++		net_from->ip[0] = fip[0];
++		net_from->ip[1] = fip[1];
++		net_from->ip[2] = fip[2];
++		net_from->ip[3] = fip[3];
++		net_from->port  = BigShort((short)fport);
++		net_message->readcount = 0;
++		net_message->cursize   = n;
++		return qtrue;
++	}
++#endif
++
+ 	if (ip_socket != INVALID_SOCKET && FD_ISSET(ip_socket, fdr))
+ 	{
+ 		fromlen = sizeof(from);
+@@ -885,6 +988,16 @@ void Sys_SendPacket(int length, const void *data, const netadr_t *to)
+ 	int                     ret = SOCKET_ERROR;
+ 	struct sockaddr_storage addr;
+ 
++#ifdef __EMSCRIPTEN__
++	// Tunnel IPv4 datagrams to the bridge over WebSocket. (Broadcast/LAN scan
++	// and IPv6 are not supported in the browser build.)
++	if (to->type == NA_IP)
++	{
++		NET_EMS_Send(to->ip, (unsigned short)BigShort(to->port), data, length);
++	}
++	return;
++#endif
++
+ 	if (to->type != NA_BROADCAST && to->type != NA_IP
+ #ifdef FEATURE_IPV6
+ 	    && to->type != NA_IP6 && to->type != NA_MULTICAST6
+@@ -2038,6 +2151,13 @@ static void NET_Config(qboolean enableNetworking)
+  */
+ void NET_Init(void)
+ {
++#ifdef __EMSCRIPTEN__
++	// The browser build reaches real UDP servers through a WebSocket bridge.
++	cvar_t *net_wsbridge = Cvar_Get("net_wsbridge", "ws://localhost:9000/", CVAR_ARCHIVE | CVAR_LATCH);
++	Com_Printf("NET_Init: using WebSocket bridge %s\n", net_wsbridge->string);
++	NET_EMS_Init(net_wsbridge->string);
++	return;
++#endif
+ #ifdef _WIN32
+ 	int sock_ret;
+ 
+@@ -2140,6 +2260,14 @@ void NET_Sleep(int64_t usec)
+ 	int            retval;
+ 	SOCKET         highestfd = INVALID_SOCKET;
+ 
++#ifdef __EMSCRIPTEN__
++	// There are no real sockets to select() on; drain any datagrams delivered
++	// by the WebSocket bridge and never block the browser main loop.
++	(void)usec; (void)timeout; (void)fdset; (void)retval; (void)highestfd;
++	NET_Event(NULL);
++	return;
++#endif
++
+ 	if (usec < 0)
+ 	{
+ 		usec = 0;
+diff --git a/src/sys/net_emscripten.c b/src/sys/net_emscripten.c
+new file mode 100644
+index 0000000..62213a4
+--- /dev/null
++++ b/src/sys/net_emscripten.c
+@@ -0,0 +1,238 @@
++/**
++ * @file net_emscripten.c
++ * @brief WebSocket transport for the browser build's networking.
++ *
++ * The browser has no UDP. This module tunnels ET datagrams over a single
++ * WebSocket to the companion Go server (bridge/main.go, /ws) that performs the
++ * real UDP send/recv against live ET servers.
++ *
++ * Wire protocol (must match bridge/main.go):
++ *   [4 bytes IPv4][2 bytes port big-endian][payload]
++ *
++ * net_ip.c calls into the small C API declared at the bottom under
++ * __EMSCRIPTEN__: NET_EMS_Init / NET_EMS_Send / NET_EMS_Recv.
++ */
++
++#ifdef __EMSCRIPTEN__
++
++#include <string.h>
++#include <stdio.h>
++#include <emscripten/websocket.h>
++
++#define NET_EMS_MAXPACKET 2048
++#define NET_EMS_QUEUE     8192  // power of two; large enough to buffer pk3 download floods
++
++typedef struct
++{
++	unsigned char  ip[4];
++	unsigned short port;
++	int            len;
++	unsigned char  data[NET_EMS_MAXPACKET];
++} net_ems_packet_t;
++
++// Incoming ring buffer (filled by the WS onmessage callback, drained by NET_GetPacket).
++static net_ems_packet_t s_rx[NET_EMS_QUEUE];
++static volatile int     s_rxHead = 0; // next write slot
++static volatile int     s_rxTail = 0; // next read slot
++
++// Outgoing queue for datagrams produced before the socket is OPEN.
++static net_ems_packet_t s_txPending[NET_EMS_QUEUE];
++static int              s_txHead = 0;
++static int              s_txTail = 0;
++
++static EMSCRIPTEN_WEBSOCKET_T s_sock  = 0;
++static int                    s_open  = 0;
++
++static void NET_EMS_RawSend(const net_ems_packet_t *p)
++{
++	unsigned char frame[6 + NET_EMS_MAXPACKET];
++	int           n = p->len;
++
++	if (n < 0 || n > NET_EMS_MAXPACKET)
++	{
++		return;
++	}
++	frame[0] = p->ip[0];
++	frame[1] = p->ip[1];
++	frame[2] = p->ip[2];
++	frame[3] = p->ip[3];
++	frame[4] = (unsigned char)(p->port >> 8);
++	frame[5] = (unsigned char)(p->port & 0xff);
++	memcpy(frame + 6, p->data, n);
++	emscripten_websocket_send_binary(s_sock, frame, 6 + n);
++}
++
++static void NET_EMS_FlushOpen(void)
++{
++	s_open = 1;
++	// Flush anything queued before the connection came up.
++	while (s_txTail != s_txHead)
++	{
++		NET_EMS_RawSend(&s_txPending[s_txTail]);
++		s_txTail = (s_txTail + 1) & (NET_EMS_QUEUE - 1);
++	}
++}
++
++static EM_BOOL NET_EMS_OnOpen(int eventType, const EmscriptenWebSocketOpenEvent *e, void *userData)
++{
++	(void)eventType; (void)e; (void)userData;
++	printf("NET_EMS: bridge WebSocket open\n");
++	NET_EMS_FlushOpen();
++	return EM_TRUE;
++}
++
++static EM_BOOL NET_EMS_OnMessage(int eventType, const EmscriptenWebSocketMessageEvent *e, void *userData)
++{
++	(void)eventType; (void)userData;
++	int next;
++
++	if (e->isText || e->numBytes < 6)
++	{
++		return EM_TRUE;
++	}
++
++	next = (s_rxHead + 1) & (NET_EMS_QUEUE - 1);
++	if (next == s_rxTail)
++	{
++		return EM_TRUE; // queue full, drop (ET protocol tolerates loss)
++	}
++
++	{
++		net_ems_packet_t *p = &s_rx[s_rxHead];
++		int              payload = e->numBytes - 6;
++		if (payload > NET_EMS_MAXPACKET)
++		{
++			payload = NET_EMS_MAXPACKET;
++		}
++		p->ip[0] = e->data[0];
++		p->ip[1] = e->data[1];
++		p->ip[2] = e->data[2];
++		p->ip[3] = e->data[3];
++		p->port  = (unsigned short)((e->data[4] << 8) | e->data[5]);
++		p->len   = payload;
++		memcpy(p->data, e->data + 6, payload);
++		s_rxHead = next;
++	}
++	return EM_TRUE;
++}
++
++static EM_BOOL NET_EMS_OnError(int eventType, const EmscriptenWebSocketErrorEvent *e, void *userData)
++{
++	(void)eventType; (void)e; (void)userData;
++	return EM_TRUE;
++}
++
++static EM_BOOL NET_EMS_OnClose(int eventType, const EmscriptenWebSocketCloseEvent *e, void *userData)
++{
++	(void)eventType; (void)e; (void)userData;
++	s_open = 0;
++	return EM_TRUE;
++}
++
++/**
++ * @brief Open the WebSocket bridge connection.
++ * @param[in] url e.g. "ws://localhost:9000/"
++ */
++void NET_EMS_Init(const char *url)
++{
++	EmscriptenWebSocketCreateAttributes attr;
++
++	if (s_sock)
++	{
++		return; // already initialised
++	}
++	if (!emscripten_websocket_is_supported())
++	{
++		printf("NET_EMS_Init: WebSockets not supported in this environment\n");
++		return;
++	}
++
++	emscripten_websocket_init_create_attributes(&attr);
++	attr.url      = url;
++	attr.protocols = "binary";
++
++	s_sock = emscripten_websocket_new(&attr);
++	if (s_sock <= 0)
++	{
++		printf("NET_EMS_Init: failed to create WebSocket to %s\n", url);
++		s_sock = 0;
++		return;
++	}
++
++	emscripten_websocket_set_onopen_callback(s_sock, NULL, NET_EMS_OnOpen);
++	emscripten_websocket_set_onmessage_callback(s_sock, NULL, NET_EMS_OnMessage);
++	emscripten_websocket_set_onerror_callback(s_sock, NULL, NET_EMS_OnError);
++	emscripten_websocket_set_onclose_callback(s_sock, NULL, NET_EMS_OnClose);
++
++	// Guard against a race where the socket is already OPEN by the time the
++	// onopen callback is registered (can happen with a local bridge).
++	{
++		unsigned short state = 0;
++		emscripten_websocket_get_ready_state(s_sock, &state);
++		if (state == 1 /* OPEN */)
++		{
++			NET_EMS_FlushOpen();
++		}
++	}
++
++	printf("NET_EMS_Init: connecting to bridge %s\n", url);
++}
++
++/**
++ * @brief Tunnel one datagram to ip:port via the bridge.
++ */
++void NET_EMS_Send(const unsigned char ip[4], unsigned short port, const void *data, int len)
++{
++	net_ems_packet_t pkt;
++
++	if (!s_sock || len < 0 || len > NET_EMS_MAXPACKET)
++	{
++		return;
++	}
++	pkt.ip[0] = ip[0]; pkt.ip[1] = ip[1]; pkt.ip[2] = ip[2]; pkt.ip[3] = ip[3];
++	pkt.port  = port;
++	pkt.len   = len;
++	memcpy(pkt.data, data, len);
++
++	if (s_open)
++	{
++		NET_EMS_RawSend(&pkt);
++	}
++	else
++	{
++		int next = (s_txHead + 1) & (NET_EMS_QUEUE - 1);
++		if (next != s_txTail)
++		{
++			s_txPending[s_txHead] = pkt;
++			s_txHead              = next;
++		}
++	}
++}
++
++/**
++ * @brief Pop one received datagram.
++ * @return payload length, or -1 if none queued.
++ */
++int NET_EMS_Recv(unsigned char ip[4], unsigned short *port, void *buf, int maxlen)
++{
++	net_ems_packet_t *p;
++	int              n;
++
++	if (s_rxTail == s_rxHead)
++	{
++		return -1;
++	}
++	p = &s_rx[s_rxTail];
++	n = p->len;
++	if (n > maxlen)
++	{
++		n = maxlen;
++	}
++	ip[0] = p->ip[0]; ip[1] = p->ip[1]; ip[2] = p->ip[2]; ip[3] = p->ip[3];
++	*port = p->port;
++	memcpy(buf, p->data, n);
++	s_rxTail = (s_rxTail + 1) & (NET_EMS_QUEUE - 1);
++	return n;
++}
++
++#endif /* __EMSCRIPTEN__ */

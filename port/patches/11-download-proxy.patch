@@ -1,0 +1,193 @@
+diff --git a/src/qcommon/download.c b/src/qcommon/download.c
+index 9e1250e..d57217d 100644
+--- a/src/qcommon/download.c
++++ b/src/qcommon/download.c
+@@ -48,6 +48,15 @@
+  */
+ const char *Com_ContainerizePath(const char *temp, const char *dest)
+ {
++#ifdef __EMSCRIPTEN__
++	// The browser build downloads over the bridge and persists fs_homepath in
++	// IDBFS. Per-server container isolation adds a mount/restart dance that races
++	// the download-abort-reconnect flow (paks land in legacy/dlcache/ but aren't
++	// re-mounted, so they re-download forever). Write straight to the gamedir so a
++	// downloaded pak is always on the search path and survives reloads.
++	(void)temp;
++	return dest;
++#else
+ 	char       hash[41] = { 0 };
+ 	const char *pakname = FS_Basename(dest);
+ 	const char *gamedir = FS_Dirpath(dest);
+@@ -68,6 +77,7 @@ const char *Com_ContainerizePath(const char *temp, const char *dest)
+ 	}
+ 
+ 	return dest;
++#endif
+ }
+ #endif
+ 
+@@ -229,6 +239,20 @@ static void Com_WebDownloadComplete(webRequest_t *request, webRequestResult requ
+ 		{
+ 			// see CL_ParseDownload, same abort strategy
+ 			Com_Printf("Download failure while getting '%s'\n", dld.downloadName);
++#ifdef __EMSCRIPTEN__
++			// The browser build downloads via the bridge's HTTP proxy. If the
++			// server's www mirror can't serve this pak (e.g. a 404 for a pak the
++			// server references but never uploaded), fall back to the UDP download
++			// path — it works over the WebSocket relay and doesn't depend on the
++			// mirror. Disable www so the reconnect renegotiates UDP downloads;
++			// paks already fetched this session are reused, so only the missing
++			// one comes over UDP.
++			if (Cvar_VariableIntegerValue("cl_wwwDownload"))
++			{
++				Com_Printf("^3www mirror failed for '%s' - falling back to UDP download over the bridge\n", dld.downloadName);
++				Cvar_Set("cl_wwwDownload", "0");
++			}
++#endif
+ 			Com_AddReliableCommand("wwwdl fail");
+ 			dld.bWWWDlAborting = qtrue;
+ 		}
+diff --git a/src/sys/dl_emscripten.c b/src/sys/dl_emscripten.c
+new file mode 100644
+index 0000000..cfb63bb
+--- /dev/null
++++ b/src/sys/dl_emscripten.c
+@@ -0,0 +1,138 @@
++/**
++ * @file dl_emscripten.c
++ * @brief Browser download backend — proxies HTTP downloads through the Go
++ *        server's /dl endpoint.
++ *
++ * The wasm build has no libcurl, and the browser cannot fetch a game server's
++ * pk3 mirror cross-origin (CORS). So when a pure server redirects us to an HTTP
++ * URL for a missing pak, we ask the companion Go server (bridge/main.go, /dl)
++ * to fetch it server-side (it caches per origin) and hand it back with permissive
++ * CORS. The fetched bytes are written straight into the virtual FS at the path the
++ * engine's download state machine expects, so the normal
++ * download -> rename -> reconnect -> pure-recheck flow just works.
++ *
++ * Only one file download is active at a time (the engine serialises them), so we
++ * keep a single request slot.
++ */
++
++#ifdef __EMSCRIPTEN__
++
++#include <emscripten.h>
++#include "../qcommon/q_shared.h"
++#include "../qcommon/qcommon.h"
++#include "../qcommon/dl_public.h"
++
++#define FILE_DOWNLOAD_ID 0xff02
++
++// Thin bridge to the JS helpers defined in web/shell.html. The heavy logic
++// (fetch via the bridge /dl proxy, FS write, progress) lives there — keeping
++// these EM_JS bodies trivial avoids EM_JS embedding pitfalls. The helper
++// publishes progress/result on a shared object; state: 1 running, 2 ok, 3 fail.
++EM_JS(void, ETL_DL_JS_Begin, (const char *urlp, const char *localp, const char *originp, const char *wsbridgep), {
++	Module.__etlDLBegin(UTF8ToString(urlp), UTF8ToString(localp), UTF8ToString(originp), UTF8ToString(wsbridgep));
++});
++
++EM_JS(int, ETL_DL_JS_State, (void), { return Module.__etlDLGet(0); });
++EM_JS(int, ETL_DL_JS_Recv, (void), { return Module.__etlDLGet(1); });
++EM_JS(int, ETL_DL_JS_Total, (void), { return Module.__etlDLGet(2); });
++EM_JS(void, ETL_DL_JS_Reset, (void), { Module.__etlDLReset(); });
++
++static webRequest_t s_req;
++static qboolean     s_active = qfalse;
++
++unsigned int DL_BeginDownload(const char *localName, const char *remoteName, void *userData, webCallbackFunc_t complete, webProgressCallbackFunc_t progress)
++{
++	if (s_active)
++	{
++		Com_Printf(S_COLOR_RED "DL_BeginDownload: a download is already active\n");
++		return 0;
++	}
++	if (!localName || !localName[0] || !remoteName || !remoteName[0])
++	{
++		Com_Printf(S_COLOR_RED "DL_BeginDownload: empty local file name or URL\n");
++		return 0;
++	}
++
++	// Create the target directory in the virtual FS (JS also mkdirTree's it).
++	FS_CreatePath((char *)localName);
++
++	Com_Memset(&s_req, 0, sizeof(s_req));
++	s_req.id           = FILE_DOWNLOAD_ID;
++	s_req.userData     = userData;
++	s_req.complete_clb = complete;
++	s_req.progress_clb = progress;
++	Q_strncpyz(s_req.url, remoteName, ARRAY_LEN(s_req.url));
++	Q_strncpyz(s_req.data.name, localName, ARRAY_LEN(s_req.data.name));
++
++	s_active = qtrue;
++
++	Com_Printf("Downloading via bridge proxy: %s\n", remoteName);
++	ETL_DL_JS_Begin(remoteName, localName,
++	                Cvar_VariableString("cl_currentServerIP"),
++	                Cvar_VariableString("net_wsbridge"));
++
++	Cvar_Set("cl_downloadName", remoteName);
++	return s_req.id;
++}
++
++unsigned int Web_CreateRequest(const char *url, const char *authToken, webUploadData_t *upload, void *userData, webCallbackFunc_t complete, webProgressCallbackFunc_t progress)
++{
++	// Uploads / arbitrary web requests (auth, stats) are not supported in the
++	// browser build.
++	(void)url; (void)authToken; (void)upload; (void)userData; (void)complete; (void)progress;
++	return 0;
++}
++
++void DL_DownloadLoop(void)
++{
++	int st;
++
++	if (!s_active)
++	{
++		return;
++	}
++
++	st = ETL_DL_JS_State();
++
++	if (s_req.progress_clb)
++	{
++		s_req.progress_clb(&s_req, (double)ETL_DL_JS_Recv(), (double)ETL_DL_JS_Total());
++	}
++
++	if (st == 2 || st == 3)
++	{
++		webCallbackFunc_t cb = s_req.complete_clb;
++
++		s_active      = qfalse;
++		s_req.httpCode = (st == 2) ? 200 : 0;
++		Cvar_Set("cl_downloadName", "");
++
++		if (st == 2)
++		{
++			Com_Printf("Bridge download complete: %s (%i bytes)\n", s_req.data.name, ETL_DL_JS_Recv());
++		}
++		else
++		{
++			Com_Printf(S_COLOR_RED "Bridge download failed: %s\n", s_req.url);
++		}
++
++		if (cb)
++		{
++			cb(&s_req, (st == 2) ? REQUEST_OK : REQUEST_NOK);
++		}
++	}
++}
++
++void DL_AbortAll(qboolean block, qboolean allowContinue)
++{
++	(void)block; (void)allowContinue;
++	s_active = qfalse;
++	ETL_DL_JS_Reset();
++}
++
++void DL_Shutdown(void)
++{
++	s_active = qfalse;
++}
++
++#endif /* __EMSCRIPTEN__ */

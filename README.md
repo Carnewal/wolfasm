@@ -16,7 +16,7 @@ a WebSocket↔UDP bridge so the browser client can talk to real live ET servers.
   mods + HUD + weapons and renders the in-game command map / player-setup screen;
   the full cgame render path runs in the browser.
 - **Connects to live servers** — the wasm client tunnels the ET UDP netchan over
-  a WebSocket to `bridge/etl-ws-bridge.js`, which relays it as real UDP. The
+  a WebSocket to the Go server (`bridge/main.go`, `/ws`), which relays it as real UDP. The
   server browser populates from the real master server, and a direct `connect`
   completes the full protocol handshake (challenge → connect → gamestate) with
   live snapshots flowing from real servers.
@@ -58,8 +58,13 @@ relinking:
     missing from Emscripten's `LEGACY_GL_EMULATION`.
   - `src/sys/net_emscripten.c` — WebSocket transport for networking.
   - `emscripten_configure.ps1`, `emscripten_build.ps1` — build helpers.
-- `bridge/` — the Node WebSocket↔UDP bridge (`etl-ws-bridge.js`).
-- `web/shell.html` — the Emscripten HTML shell (canvas + loader + args).
+- `bridge/` — the unified Go server (`main.go`): serves the shell + WebSocket↔UDP
+  relay (`/ws`) + pk3 download proxy (`/dl`) on one port.
+- `web/shell.html` — the Emscripten HTML shell (markup); `web/shell.js` — the
+  browser-side logic (Module setup, IDBFS persistence, faker name, download proxy,
+  URL-driven connect/devmap). `shell.html` is baked into `etl.html` at link time;
+  `shell.js` is served alongside it.
+- `Dockerfile` — whole end-to-end build → self-contained serving image.
 - `assets/etmain/` — the retail ET `pk3` files (downloaded separately).
 - `emsdk/` — the Emscripten SDK.
 
@@ -93,30 +98,43 @@ before the module, and passes `+set fs_basepath /etl`.
 > Note: editing `web/shell.html` does **not** re-trigger a link (Ninja does not
 > track `--shell-file`). Delete `build-wasm/etl.html` before rebuilding.
 
-## Run
+## Run with Docker (whole thing, one command)
 
-```powershell
-# serve the build directory over HTTP (wasm needs http, not file://)
-python -m http.server 8080 --directory etlegacy/build-wasm
-# open http://localhost:8080/etl.html
+The `Dockerfile` does the entire end-to-end build — clone ET:Legacy v2.84.0, apply
+the port patches, build the wasm client, download the game data + package it, build
+the Go server — and produces a self-contained image that serves the game:
+
+```bash
+docker build -t wolfasm .
+docker run -p 8080:8080 wolfasm        # open http://localhost:8080/
 ```
 
-## Connect to live servers
+`/` lands straight in the game. For a deployment (e.g. `play.wolfasm.com`) put it
+behind a TLS-terminating proxy; the client auto-uses `wss://` over HTTPS.
 
-Start the bridge, then load the client (its `net_wsbridge` cvar defaults to
-`ws://localhost:9000/`):
+## Run without Docker (unified Go server)
 
-```powershell
+`bridge/` is a single Go binary that serves the shell **and** the WebSocket↔UDP
+relay **and** the pk3 download proxy on **one port**, so the client talks to one
+origin (and reaches live servers out of the box). See `bridge/README.md`.
+
+```bash
 cd bridge
-npm install ws        # once
-node etl-ws-bridge.js --port 9000
+go build -o wolfasm-server .      # Go 1.23+
+WOLFASM_WEBROOT=../etlegacy/build-wasm ./wolfasm-server
+# open http://localhost:8080/
 ```
 
-Get a live server address from
-`https://www.etlegacy.com/servers` and, from the in-game console (or via a
-`+serverstatus <ip:port>` startup arg in `web/shell.html`), query it — e.g.
-`serverstatus 37.187.251.48:27960`. The bridge logs the UDP relay and the
-server's reply appears in the browser console.
+The client derives `ws(s)://<host>/ws` and `<origin>/dl` from the page URL, so the
+same build works on `localhost` and on a deployed host (e.g. `play.wolfasm.com`)
+unchanged. Configure per deployment via `.env` (`WOLFASM_ADDR`, `WOLFASM_TLS_*`,
+`WOLFASM_PUBLIC_HOST`, …) — see `bridge/.env.example`. The page is auto-assigned a
+random player name (faker) on first load, stored in `localStorage` + the profile.
+
+From the in-game console (or a `+serverstatus <ip:port>` startup arg), query a
+live server, e.g. `serverstatus 78.46.121.107:27961`; joining a pure server
+auto-downloads its paks through the proxy (cached per origin).
+
 
 The server browser works: the master server is reached (its hostname resolves
 via a small known-host table in `net_ip.c`, plus numeric IPs in `web/shell.html`),

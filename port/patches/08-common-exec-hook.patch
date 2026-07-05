@@ -1,0 +1,46 @@
+diff --git a/src/qcommon/common.c b/src/qcommon/common.c
+index 8555173..b67b3ae 100644
+--- a/src/qcommon/common.c
++++ b/src/qcommon/common.c
+@@ -61,10 +61,10 @@
+ 
+ #ifdef FEATURE_DBMS
+ #include "../db/db_sql.h"
+-#include "q_unicode.h"
+-
+ #endif
+ 
++#include "q_unicode.h"
++
+ // NOTE: if protocol gets bumped please add 84 to the list before 0
+ // 2.55 82, 2.56 83, 2.6 84
+ int demo_protocols[] =
+@@ -3500,6 +3500,28 @@ int64_t Com_TimeVal(int64_t minUsec)
+ 	return timeVal;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++/**
++ * @brief Push a console command into the buffer from JavaScript.
++ *
++ * The browser has no real keyboard focus/pointer-lock automation path for
++ * driving the client, and there is no other way to reach the command buffer of
++ * a running instance. Expose a tiny entry point so the host page can issue
++ * console commands (connect, reconnect, bind, +forward, +attack, ...) via
++ * Module.ccall('ETL_ExecCommand', null, ['string'], [cmd]). Runs on the main
++ * thread (single-threaded wasm), so it is executed on the next Cbuf_Execute.
++ */
++EMSCRIPTEN_KEEPALIVE void ETL_ExecCommand(const char *cmd)
++{
++	if (cmd && cmd[0])
++	{
++		Cbuf_AddText(cmd);
++		Cbuf_AddText("\n");
++	}
++}
++#endif
++
+ /**
+  * @brief Com_Frame
+  */

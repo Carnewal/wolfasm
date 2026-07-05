@@ -1,0 +1,18 @@
+# The build clones etlegacy, installs emsdk (via the base image) and downloads
+# assets itself — keep the local copies of all that out of the build context.
+etlegacy/
+emsdk/
+assets/
+assets_mods/
+.tools/
+debug/
+.git/
+.claude/
+bridge/wolfasm-server
+bridge/dlcache/
+**/node_modules/
+*.pk3
+*.data
+*.wasm
+*.o
+*.a

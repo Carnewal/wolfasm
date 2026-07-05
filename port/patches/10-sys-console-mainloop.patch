@@ -1,0 +1,104 @@
+diff --git a/src/sys/con_tty.c b/src/sys/con_tty.c
+index e4518d3..b9cce1f 100644
+--- a/src/sys/con_tty.c
++++ b/src/sys/con_tty.c
+@@ -295,6 +295,16 @@ void CON_Init(void)
+ {
+ 	struct termios tc;
+ 
++#ifdef __EMSCRIPTEN__
++	// The browser has no stdin console; input arrives via the canvas / the
++	// ETL_ExecCommand JS hook. Leaving stdin "active" makes CON_Input call
++	// read(STDIN_FILENO), which Emscripten services with a blocking
++	// window.prompt() that freezes the whole main loop. Disable it entirely.
++	ttycon_on    = qfalse;
++	stdin_active = qfalse;
++	return;
++#endif
++
+ 	// If the process is backgrounded (running non interactively)
+ 	// then SIGTTIN or SIGTOU is emitted, if not caught, turns into a SIGSTP
+ 	signal(SIGTTIN, SIG_IGN);
+@@ -350,6 +360,10 @@ CON_Input
+ */
+ char *CON_Input(void)
+ {
++#ifdef __EMSCRIPTEN__
++	// No stdin in the browser (see CON_Init); never read it (would prompt()).
++	return NULL;
++#endif
+ 	// we use this when sending back commands
+ 	static char text[MAX_EDIT_LINE];
+ 	char        key;
+diff --git a/src/sys/sys_main.c b/src/sys/sys_main.c
+index 0fd4409..4e5c3e0 100644
+--- a/src/sys/sys_main.c
++++ b/src/sys/sys_main.c
+@@ -56,6 +56,10 @@
+ #include "../qcommon/q_shared.h"
+ #include "../qcommon/qcommon.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
++
+ #ifdef _WIN32
+ #include <windows.h>
+ #include "sys_win32.h"
+@@ -1287,6 +1291,16 @@ static int Sys_GameLoop(void)
+ 	totalMsec = countMsec = 0;
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++	// The browser owns the event loop; hand Com_Frame to it and never return.
++	// simulate_infinite_loop = 1 throws to unwind so main() never returns (a
++	// normal return triggers an exit/atexit flush that stops the loop under
++	// MAIN_MODULE). fps > 0 drives the loop with setTimeout, which keeps running
++	// even when the tab is backgrounded (requestAnimationFrame is throttled for
++	// hidden tabs). Com_Frame has its own framerate limiter (com_maxfps).
++	emscripten_set_main_loop(Com_Frame, 60, 1);
++	return return_code; // not reached
++#else
+ #ifdef __clang__
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wmissing-noreturn"
+@@ -1333,6 +1347,7 @@ static int Sys_GameLoop(void)
+ #ifdef __clang__
+ #pragma clang diagnostic pop
+ #endif /* __clang__ */
++#endif /* __EMSCRIPTEN__ */
+ 	return return_code;
+ }
+ 
+diff --git a/src/sys/sys_unix.c b/src/sys/sys_unix.c
+index 348f108..ca78b1f 100644
+--- a/src/sys/sys_unix.c
++++ b/src/sys/sys_unix.c
+@@ -41,7 +41,9 @@
+ #include "../qcommon/qcommon.h"
+ #include "sys_local.h"
+ 
++#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+ #include <execinfo.h>
++#endif
+ #include <signal.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+@@ -1279,7 +1281,7 @@ void Sys_Backtrace(int sig)
+ 	size_t size;
+ 
+ 	// Get the backtrace and write it to stderr
+-#ifndef __ANDROID__
++#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+ 	size = backtrace(syms, 32);
+ #endif
+ 	fprintf(stderr, "--- Report this to the project - START ---\n");
+@@ -1287,7 +1289,7 @@ void Sys_Backtrace(int sig)
+ 	fprintf(stderr, "VERSION: %s (%s)\n", ETLEGACY_VERSION, ETLEGACY_VERSION_SHORT);
+ 	fprintf(stderr, "BTIME: %s\n", PRODUCT_BUILD_TIME);
+ 	fprintf(stderr, "BACKTRACE:\n");
+-#ifndef __ANDROID__
++#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+ 	backtrace_symbols_fd(syms, size, STDERR_FILENO);
+ #endif
+ 	fprintf(stderr, "--- Report this to the project -  END  ---\n");

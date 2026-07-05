@@ -1,0 +1,86 @@
+diff --git a/src/qcommon/files.c b/src/qcommon/files.c
+index d36457c..145f1cb 100644
+--- a/src/qcommon/files.c
++++ b/src/qcommon/files.c
+@@ -4809,6 +4809,56 @@ const char *FS_ReferencedPakNames(void)
+  *
+  * @note The string has a specific order, "cgame ui @ ref1 ref2 ref3 ..."
+  */
++#ifdef __EMSCRIPTEN__
++/**
++ * @brief Mark the pak containing the server-side cgame/ui module as referenced.
++ *
++ * The browser client loads cgame/ui as loose wasm side-modules, so no pak is
++ * ever flagged FS_CGAME_REF/FS_UI_REF. A pure server (SV_VerifyPaks_f) requires
++ * the first two "cp" checksums to be the cgame and ui pak pure checksums and
++ * rejects a leading '@'. The real mod pak we have (e.g. the legacy pk3) holds
++ * the native cgame/ui binaries, so flag it to report the checksum the server
++ * expects.
++ */
++static void FS_EMS_MarkModRef(const char *const *names, int flag)
++{
++	searchpath_t *search;
++	int          n;
++
++	for (search = fs_searchpaths; search; search = search->next)
++	{
++		if (search->pack && (search->pack->referenced & flag))
++		{
++			return; // already flagged
++		}
++	}
++	for (search = fs_searchpaths; search; search = search->next)
++	{
++		pack_t *pak = search->pack;
++
++		if (!pak)
++		{
++			continue;
++		}
++		for (n = 0; names[n]; n++)
++		{
++			long         hash = FS_HashFileName(names[n], pak->hashSize);
++			fileInPack_t *pf  = pak->hashTable[hash];
++
++			while (pf)
++			{
++				if (!FS_FilenameCompare(pf->name, names[n]))
++				{
++					pak->referenced |= flag;
++					return;
++				}
++				pf = pf->next;
++			}
++		}
++	}
++}
++#endif
++
+ const char *FS_ReferencedPakPureChecksums(void)
+ {
+ 	static char  info[BIG_INFO_STRING];
+@@ -4818,6 +4868,24 @@ const char *FS_ReferencedPakPureChecksums(void)
+ 
+ 	info[0] = 0;
+ 
++#ifdef __EMSCRIPTEN__
++	if (fs_searchpaths)
++	{
++		static const char *const cgnames[] =
++		{
++			"cgame.mp.x86_64.so", "cgame.mp.i386.so", "cgame.mp.aarch64.so",
++			"cgame.mp.x86.dll",   "cgame.mp.x86_64.dll", "vm/cgame.qvm", NULL
++		};
++		static const char *const uinames[] =
++		{
++			"ui.mp.x86_64.so", "ui.mp.i386.so", "ui.mp.aarch64.so",
++			"ui.mp.x86.dll",   "ui.mp.x86_64.dll", "vm/ui.qvm", NULL
++		};
++		FS_EMS_MarkModRef(cgnames, FS_CGAME_REF);
++		FS_EMS_MarkModRef(uinames, FS_UI_REF);
++	}
++#endif
++
+ 	for (nFlags = FS_CGAME_REF; nFlags; nFlags = nFlags >> 1)
+ 	{
+ 		if (nFlags & FS_GENERAL_REF)
